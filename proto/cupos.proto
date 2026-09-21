@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package cupo;
+
+service Cupos {
+
+  rpc obtenerCupo(ObtenerRequest) returns (Curso);
+  
+  // devuelve todos los cursos impartidos
+  rpc listarCursos(ListarRequest) returns (ListarCursosResponse);
+  
+  // devuelve solo los cursos con cupos libres
+  rpc listarCursosDisponibles(ListarRequest) returns (ListarCursosResponse);
+
+  rpc ocuparCupo(OcuparRequest) returns (OcuparResponse);
+
+  rpc liberarCupo(LiberarRequest) returns (LiberarResponse);
+}
+
+enum Estado {
+  ESTADO_SIN_DEFINIR = 0;
+  CUPO_OCUPADO = 1;
+  SIN_CUPOS = 2;
+  CUPO_LIBERADO = 3;
+  CURSO_NO_ENCONTRADO = 4;
+}
+
+message ObtenerRequest {
+  int32 curso_id = 1;
+}
+
+message ListarRequest {}
+
+message Curso {
+  int32 curso_id = 1;
+  string nombre = 2;
+  int32 cupos_totales = 3;
+  int32 cupos_libres = 4;
+}
+
+message ListarCursosResponse {
+  repeated Curso cursos = 1;
+}
+
+message OcuparRequest {
+  int32 curso_id = 1;
+}
+
+message OcuparResponse {
+  Estado estado = 1;
+}
+
+message LiberarRequest {
+  int32 curso_id = 1;
+}
+
+message LiberarResponse {
+  Estado estado = 1;
+}
+
