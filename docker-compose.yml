@@ -1,0 +1,17 @@
+services:
+  cupos:
+    build:
+      context: .                    # raíz del servicio cupos
+      dockerfile: cupos/Dockerfile
+    environment:
+      DB_PATH: /data/cupos.db
+      SIMULAR_LATENCIA_MS: "0"      # subir para probar timeouts
+    volumes:
+      - cupos_data:/data            # BD propia del servicio (T5)
+    expose:
+      - "50051"                     # no publicar al exterior
+    ports:
+      - "50051:50051"               # para pruebas locales
+
+volumes:
+  cupos_data:

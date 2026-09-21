@@ -6,3 +6,20 @@ La Centro de Formación Técnica AprendeMás opera hoy con dos sistemas que naci
 - Matrículas: un sistema que registra a los estudiantes y sus matrículas. Necesita saber, para cada curso, si hay cupos disponibles antes de matricular a un estudiante, y consulta esa información con muchísima frecuencia. Hoy los dos sistemas no están integrados: se matricula sin verificar cupos y algunos cursos superan la capacidad de la sala.
 
 Este proyecto implementa una solución de integración para el Sistema de Gestión de Cursos y Matrículas del AprendeMás, y prueba la resiliencia de esta a través de experimentos.
+
+## Instrucciones de Ejecución
+
+Para ejecutar todos los servicios:
+
+```bash
+docker compose up 
+
+```
+
+### Servicio Cupos
+
+Para ejecutarlo por separado ejecutar:
+
+```bash
+docker compose up --build cupos
+```
