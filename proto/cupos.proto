@@ -4,7 +4,7 @@ package cupo;
 
 service Cupos {
 
-  rpc obtenerCupo(ObtenerRequest) returns (Curso);
+  rpc obtenerCupo(ObtenerRequest) returns (ObtenerResponse);
   
   // devuelve todos los cursos impartidos
   rpc listarCursos(ListarRequest) returns (ListarCursosResponse);
@@ -29,6 +29,9 @@ message ObtenerRequest {
   int32 curso_id = 1;
 }
 
+message ObtenerResponse {
+  int32 cupos_libres = 1;
+}
 message ListarRequest {}
 
 message Curso {
