@@ -1,0 +1,4 @@
+cupos/src/__pycache__/
+cupos/src/cupos_pb2.py
+cupos/src/cupos_pb2_grpc.py
+.venv
