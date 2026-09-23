@@ -13,5 +13,42 @@ services:
     ports:
       - "50051:50051"               # para pruebas locales
 
+  matriculas-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${MATRICULAS_DB_NAME:-matriculas_db}
+      POSTGRES_USER: ${MATRICULAS_DB_USER:-matriculas_user}
+      POSTGRES_PASSWORD: ${MATRICULAS_DB_PASSWORD:-matriculas_pass}
+    volumes:
+      - matriculas_db_data:/var/lib/postgresql/data   # BD propia del servicio (T5), igual que cupos_data
+    expose:
+      - "5432"                      # solo visible para otros servicios del compose
+    ports:
+      - "5432:5432"                 # para pruebas locales (psql, etc.) - quitar en un despliegue real
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${MATRICULAS_DB_USER:-matriculas_user} -d ${MATRICULAS_DB_NAME:-matriculas_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  matriculas:
+    build:
+      context: .                    # raíz del monorepo, igual que cupos
+      dockerfile: matriculas/Dockerfile
+    restart: "no"                   # no es un servidor: corre una vez y termina (ver README)
+    stdin_open: true                # necesario: matriculas es un CLI interactivo
+    tty: true
+    environment:
+      DB_HOST: matriculas-db
+      DB_PORT: 5432
+      DB_NAME: ${MATRICULAS_DB_NAME:-matriculas_db}
+      DB_USER: ${MATRICULAS_DB_USER:-matriculas_user}
+      DB_PASSWORD: ${MATRICULAS_DB_PASSWORD:-matriculas_pass}
+    depends_on:
+      matriculas-db:
+        condition: service_healthy
+
 volumes:
   cupos_data:
+  matriculas_db_data:
