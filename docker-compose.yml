@@ -48,6 +48,29 @@ services:
     depends_on:
       matriculas-db:
         condition: service_healthy
+    profiles: ["legacy"]            # CLI "antes de la integración" (ver README) - no se levanta por defecto
+
+  # API REST pública de Matrículas (Python/FastAPI). Valida disponibilidad
+  # de cupos contra `cupos` vía gRPC antes de confirmar cada matrícula.
+  matriculas-api:
+    build:
+      context: .                    # raíz del monorepo, igual que los demás (necesita proto/)
+      dockerfile: matriculas-api/Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${MATRICULAS_DB_USER:-matriculas_user}:${MATRICULAS_DB_PASSWORD:-matriculas_pass}@matriculas-db:5432/${MATRICULAS_DB_NAME:-matriculas_db}
+      CUPOS_GRPC_TARGET: cupos:50051
+      CUPOS_GRPC_TIMEOUT_SECONDS: ${CUPOS_GRPC_TIMEOUT_SECONDS:-2.0}
+      CUPOS_CB_FAILURE_THRESHOLD: ${CUPOS_CB_FAILURE_THRESHOLD:-5}
+      CUPOS_CB_RECOVERY_SECONDS: ${CUPOS_CB_RECOVERY_SECONDS:-15.0}
+      API_KEYS: ${MATRICULAS_API_KEYS:-dev-matriculas-key-123}
+    ports:
+      - "8000:8000"                 # API pública
+    depends_on:
+      matriculas-db:
+        condition: service_healthy
+      cupos:
+        condition: service_started
 
 volumes:
   cupos_data:

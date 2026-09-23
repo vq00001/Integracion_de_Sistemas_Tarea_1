@@ -7,21 +7,40 @@ La Centro de Formación Técnica AprendeMás opera hoy con dos sistemas que naci
 
 Este proyecto implementa una solución de integración para el Sistema de Gestión de Cursos y Matrículas del AprendeMás, y prueba la resiliencia de esta a través de experimentos.
 
+**La integración vive en `matriculas-api/`**: una API REST pública
+(Python/FastAPI) que expone Matrículas y, del lado del servidor,
+consulta el gRPC de Cupos para decidir si un curso tiene cupos antes de
+confirmar cada matrícula. Ver `matriculas-api/README.md` para el detalle
+completo (autenticación, manejo de fallas del gRPC, endpoints, OpenAPI).
+El CLI de Node en `matriculas/` se conserva solo como referencia del
+estado "antes de la integración" descrito más abajo; no se levanta por
+defecto.
+
 ## Estructura del repositorio
 
 ```
 .
-├── docker-compose.yml     # orquesta TODOS los servicios (cupos + matriculas)
+├── docker-compose.yml     # orquesta TODOS los servicios (cupos + matriculas-db + matriculas-api [+ matriculas, legacy])
 ├── .env.example
 ├── proto/
 │   └── cupos.proto          # contrato gRPC de Cupos (fuente de verdad de la integración)
-├── cupos/                   # servicio Cupos (Python + gRPC + SQLite)
+├── cupos/                   # servicio Cupos (Python + gRPC + SQLite) - sin cambios
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── src/
 │       ├── server.py
 │       └── generar.py        # genera los stubs (*_pb2.py) desde proto/cupos.proto
-└── matriculas/               # servicio Matrículas (Node.js + Postgres)
+├── matriculas-api/          # ★ API REST de Matrículas (Python + FastAPI) - la integración
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── README.md             # autenticación, resiliencia, endpoints, cómo correrla
+│   └── app/
+│       ├── main.py, config.py, database.py, models.py, schemas.py
+│       ├── security.py       # autenticación por API Key
+│       ├── errors.py         # errores JSON uniformes
+│       ├── grpc_client.py + circuit_breaker.py  # cliente gRPC resiliente hacia Cupos
+│       └── routers/          # students, enrollments, health
+└── matriculas/               # CLI legado (Node.js + Postgres) - "antes de la integración"
     ├── Dockerfile
     ├── package.json
     └── src/
@@ -53,30 +72,33 @@ cupos" porque ni siquiera tiene forma de verificar que el curso exista.
 
 ## Instrucciones de ejecución
 
-### Levantar todo lo que debe quedar corriendo
+### Levantar la integración completa (Cupos + Matrículas API)
 
 ```bash
 cp .env.example .env
-docker compose up --build -d cupos matriculas-db
+docker compose up --build -d cupos matriculas-db matriculas-api
 ```
 
-### Preparar la base de datos de Matrículas (una vez, o cada vez que cambie el esquema)
+La API REST de Matrículas queda en `http://localhost:8000` (docs en
+`/docs`). Ver `matriculas-api/README.md` para ejemplos de uso con
+`curl`, la lista de endpoints y el mecanismo de autenticación.
+
+### (Referencia) CLI legado de Matrículas, sin integración con Cupos
+
+Se mantiene solo para comparar el comportamiento "antes de la
+integración". No se levanta con `docker compose up` por defecto (usa un
+profile):
 
 ```bash
-docker compose run --rm matriculas node src/index.js
-```
-
-### Usar Matrículas (CLI interactivo de uso interno)
-
-```bash
-docker compose run --rm -it matriculas npm run cli
+docker compose --profile legacy run --rm matriculas node src/index.js   # prepara el esquema, una vez
+docker compose --profile legacy run --rm -it matriculas npm run cli
 ```
 
 Este CLI reproduce a propósito el problema descrito en el enunciado:
 matricula sin verificar cupos disponibles contra Cupos (ver
 `matriculas/src/cli/actions/enrollments.js`). Es intencional — es la
 versión "antes de la integración", para poder comparar el comportamiento
-una vez que se conecte con Cupos.
+contra `matriculas-api`, que sí valida contra Cupos.
 
 ### Servicio Cupos por separado
 
