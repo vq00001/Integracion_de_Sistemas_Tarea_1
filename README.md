@@ -108,11 +108,62 @@ Para ejecutarlo solo:
 docker compose up --build cupos
 ```
 
-Prueba rápida por línea de comandos (usando `grpcurl`, si lo tienes instalado):
+## Tests
+
+La suite de pruebas valida el contrato gRPC de Cupos, los endpoints REST de
+Matrículas, la autenticación, el manejo de errores, la reserva y liberación
+de cupos, la idempotencia y el comportamiento cuando Cupos no está
+disponible.
+
+### Requisitos
+
+Instala las dependencias de pruebas en el entorno virtual del proyecto:
 
 ```bash
-grpcurl -plaintext -import-path proto -proto cupos.proto \
-  -d '{"curso_id": 5}' localhost:50051 cupo.Cupos/obtenerCupo
+python -m pip install -r tests/requirements.txt
 ```
 
-(El curso `5`, "Ciberseguridad Básica", viene precargado con solo 2 cupos — útil para probar el caso sin cupos.)
+Levanta los servicios antes de ejecutar las pruebas:
+
+```bash
+docker compose up --build -d cupos matriculas-db matriculas-api
+```
+
+### Ejecutar la suite completa
+
+Desde la raíz del repositorio:
+
+```bash
+python -m pytest tests -q
+```
+
+### Ejecutar por categoría
+
+Solo contrato gRPC:
+
+```bash
+python -m pytest tests/grpc -q
+```
+
+Solo API REST e integración:
+
+```bash
+python -m pytest tests/integration -q
+```
+
+Solo las pruebas de integración con gRPC:
+
+```bash
+python -m pytest -m grpc tests -q
+```
+
+Las pruebas marcadas como `falla` detienen y reinician el contenedor `cupos`.
+Ejecútalas sin paralelismo y con Docker disponible:
+
+```bash
+python -m pytest -m falla tests -q
+```
+
+La suite completa tiene actualmente **28 pruebas**. El resultado esperado es
+`28 passed` cuando los servicios están levantados y la base de datos de Cupos
+está disponible.
