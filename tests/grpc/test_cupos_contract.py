@@ -83,10 +83,6 @@ def test_ocupar_es_idempotente(cupos_stub):
     assert despues == antes - 1, "se descontó más de un cupo por una sola idempotency_key"
     stub.liberarCupo(pb2.LiberarRequest(curso_id=CURSO_CON_CUPO, idempotency_key=uuid.uuid4().hex))
 
-@pytest.mark.xfail(
-    reason="Bug conocido",
-    strict=True
-)
 def test_liberar_con_la_misma_clave_de_un_ocupar_previo_no_deberia_crashear(cupos_stub):
     """Reproduce el caso en que la misma clave se usa para ocupar y luego liberar, sin que falle el servidor."""
     pb2, stub = cupos_stub.pb2, cupos_stub.stub
@@ -94,10 +90,6 @@ def test_liberar_con_la_misma_clave_de_un_ocupar_previo_no_deberia_crashear(cupo
     stub.ocuparCupo(pb2.OcuparRequest(curso_id=CURSO_CON_CUPO, idempotency_key=clave))
     stub.liberarCupo(pb2.LiberarRequest(curso_id=CURSO_CON_CUPO, idempotency_key=clave))
 
-@pytest.mark.xfail(
-    reason="Bug conocido",
-    strict=True
-)
 def test_liberar_dos_veces_con_la_misma_clave_es_idempotente(cupos_stub):
     """Verifica que repetir liberarCupo con la misma clave no debe romper ni duplicar la liberación."""
     pb2, stub = cupos_stub.pb2, cupos_stub.stub

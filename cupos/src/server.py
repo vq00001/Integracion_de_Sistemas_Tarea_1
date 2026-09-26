@@ -67,16 +67,38 @@ def init_db() -> None:
             )"""
         )
 
-        # crear tabla para asegurar idempotencia
-        con.execute(
-            """CREATE TABLE IF NOT EXISTS operaciones_idempotentes (
-                clave      TEXT PRIMARY KEY,
-                operacion  TEXT NOT NULL,
-                curso_id   INTEGER NOT NULL,
-                estado     INTEGER NOT NULL,
-                creado_en  TEXT NOT NULL DEFAULT (datetime('now'))
-            )"""
-        )
+        # La operación forma parte de la identidad: una misma clave puede
+        # usarse una vez para ocupar y otra vez para liberar.
+        tabla_operaciones = con.execute(
+            "PRAGMA table_info(operaciones_idempotentes)"
+        ).fetchall()
+        if tabla_operaciones:
+            claves_primarias = [columna["name"] for columna in tabla_operaciones if columna["pk"]]
+            if claves_primarias == ["clave"]:
+                con.execute("ALTER TABLE operaciones_idempotentes RENAME TO operaciones_idempotentes_legacy")
+                tabla_operaciones = []
+
+        if not tabla_operaciones:
+            con.execute(
+                """CREATE TABLE IF NOT EXISTS operaciones_idempotentes (
+                    clave      TEXT NOT NULL,
+                    operacion  TEXT NOT NULL,
+                    curso_id   INTEGER NOT NULL,
+                    estado     INTEGER NOT NULL,
+                    creado_en  TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (clave, operacion)
+                )"""
+            )
+            if con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='operaciones_idempotentes_legacy'"
+            ).fetchone():
+                con.execute(
+                    """INSERT INTO operaciones_idempotentes
+                    (clave, operacion, curso_id, estado, creado_en)
+                    SELECT clave, operacion, curso_id, estado, creado_en
+                    FROM operaciones_idempotentes_legacy"""
+                )
+                con.execute("DROP TABLE operaciones_idempotentes_legacy")
 
         ## si no hay datos en la tabla, insertarlos
         if con.execute("SELECT COUNT(*) FROM cursos").fetchone()[0] == 0:
@@ -198,9 +220,9 @@ class CuposService(cupos_pb2_grpc.CuposServicer):
                 ).fetchone()
                 if previa is not None:
                     log.info(
-                        "ocuparCupo repetido, clave=%s -> resultado cacheado", clave
+                        "liberarCupo repetido, clave=%s -> resultado cacheado", clave
                     )
-                    return cupos_pb2.OcuparResponse(estado=previa["estado"])
+                    return cupos_pb2.LiberarResponse(estado=previa["estado"])
 
             cur = con.execute(
                 "UPDATE cursos SET cupos_libres = cupos_libres + 1 "
@@ -226,7 +248,7 @@ class CuposService(cupos_pb2_grpc.CuposServicer):
             if clave:
                 con.execute(
                     "INSERT INTO operaciones_idempotentes (clave, operacion, curso_id, estado) "
-                    "VALUES (?, 'ocupar', ?, ?)",
+                    "VALUES (?, 'liberar', ?, ?)",
                     (clave, request.curso_id, estado),
                 )
 
