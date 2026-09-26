@@ -11,3 +11,6 @@ tests/.generated/
 # Dependencias y archivos de ejecución locales.
 node_modules/
 *.db
+
+# Resultados de experimentos y benchmarks.
+*.csv

@@ -5,7 +5,7 @@ services:
       dockerfile: cupos/Dockerfile
     environment:
       DB_PATH: /data/cupos.db
-      SIMULAR_LATENCIA_MS: "0"      # subir para probar timeouts
+      SIMULAR_LATENCIA_MS: ${SIMULAR_LATENCIA_MS:-0}  # latencia artificial para pruebas
     volumes:
       - cupos_data:/data            # BD propia del servicio (T5)
     expose:
