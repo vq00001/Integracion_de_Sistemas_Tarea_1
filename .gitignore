@@ -1,0 +1,16 @@
+.venv/
+.env
+*.py[cod]
+__pycache__/
+.pytest_cache/
+
+# Stubs gRPC generados durante la ejecución de los tests.
+.generated/
+tests/.generated/
+
+# Dependencias y archivos de ejecución locales.
+node_modules/
+*.db
+
+# Resultados de experimentos y benchmarks.
+*.csv

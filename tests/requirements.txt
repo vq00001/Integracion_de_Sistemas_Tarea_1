@@ -1,0 +1,5 @@
+pytest>=8
+requests>=2.32
+grpcio>=1.64
+grpcio-tools>=1.64
+pyyaml>=6

@@ -55,6 +55,8 @@ def init_db() -> None:
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     with conexion() as con:
         con.execute("PRAGMA journal_mode=WAL")
+
+        # crear base de datos minima para el microservicio
         con.execute(
             """CREATE TABLE IF NOT EXISTS cursos (
                 curso_id      INTEGER PRIMARY KEY,
@@ -64,6 +66,39 @@ def init_db() -> None:
                 CHECK (cupos_libres >= 0 AND cupos_libres <= cupos_totales)
             )"""
         )
+
+        # La operación forma parte de la identidad: una misma clave puede
+        # usarse una vez para ocupar y otra vez para liberar.
+        tabla_operaciones = con.execute(
+            "PRAGMA table_info(operaciones_idempotentes)"
+        ).fetchall()
+        if tabla_operaciones:
+            claves_primarias = [columna["name"] for columna in tabla_operaciones if columna["pk"]]
+            if claves_primarias == ["clave"]:
+                con.execute("ALTER TABLE operaciones_idempotentes RENAME TO operaciones_idempotentes_legacy")
+                tabla_operaciones = []
+
+        if not tabla_operaciones:
+            con.execute(
+                """CREATE TABLE IF NOT EXISTS operaciones_idempotentes (
+                    clave      TEXT NOT NULL,
+                    operacion  TEXT NOT NULL,
+                    curso_id   INTEGER NOT NULL,
+                    estado     INTEGER NOT NULL,
+                    creado_en  TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (clave, operacion)
+                )"""
+            )
+            if con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='operaciones_idempotentes_legacy'"
+            ).fetchone():
+                con.execute(
+                    """INSERT INTO operaciones_idempotentes
+                    (clave, operacion, curso_id, estado, creado_en)
+                    SELECT clave, operacion, curso_id, estado, creado_en
+                    FROM operaciones_idempotentes_legacy"""
+                )
+                con.execute("DROP TABLE operaciones_idempotentes_legacy")
 
         ## si no hay datos en la tabla, insertarlos
         if con.execute("SELECT COUNT(*) FROM cursos").fetchone()[0] == 0:
@@ -86,7 +121,7 @@ def a_curso(row: sqlite3.Row) -> cupos_pb2.Curso:
 # MICROSERVICIO CUPOS
 
 
-class CuposServicer(cupos_pb2_grpc.CuposServicer):
+class CuposService(cupos_pb2_grpc.CuposServicer):
     def _simular_latencia(self):
         if LATENCIA_MS > 0:
             time.sleep(LATENCIA_MS / 1000)
@@ -123,7 +158,23 @@ class CuposServicer(cupos_pb2_grpc.CuposServicer):
 
     def ocuparCupo(self, request, context):
         self._simular_latencia()
+
+        clave = request.idempotency_key
         with conexion() as con:
+            if clave:  # revisar que no sea un request repetido:with
+                previa = con.execute(
+                    "SELECT estado FROM operaciones_idempotentes "
+                    "WHERE clave = ? AND operacion = 'ocupar' AND curso_id = ?",
+                    (clave, request.curso_id),
+                ).fetchone()
+
+                # si se repite, devuelve el resultado del primero
+                if previa is not None:
+                    log.info(
+                        "ocuparCupo repetido, clave=%s -> resultado cacheado", clave
+                    )
+                    return cupos_pb2.OcuparResponse(estado=previa["estado"])
+
             # resta uno a la cantidad de cupos libres, si es que quedan
             cur = con.execute(
                 "UPDATE cursos SET cupos_libres = cupos_libres - 1 "
@@ -141,6 +192,14 @@ class CuposServicer(cupos_pb2_grpc.CuposServicer):
                     cupos_pb2.SIN_CUPOS if existe else cupos_pb2.CURSO_NO_ENCONTRADO
                 )
 
+            # registrar operacion
+            if clave:
+                con.execute(
+                    "INSERT INTO operaciones_idempotentes (clave, operacion, curso_id, estado) "
+                    "VALUES (?, 'ocupar', ?, ?)",
+                    (clave, request.curso_id, estado),
+                )
+
         log.info(
             "ocupar cupo curso=%s -> %s",
             request.curso_id,
@@ -150,7 +209,21 @@ class CuposServicer(cupos_pb2_grpc.CuposServicer):
 
     def liberarCupo(self, request, context):
         self._simular_latencia()
+
+        clave = request.idempotency_key
         with conexion() as con:
+            if clave:  # checkear que no sea un mensaje repetido
+                previa = con.execute(
+                    "SELECT estado FROM operaciones_idempotentes "
+                    "WHERE clave = ? AND operacion = 'liberar' AND curso_id = ?",
+                    (clave, request.curso_id),
+                ).fetchone()
+                if previa is not None:
+                    log.info(
+                        "liberarCupo repetido, clave=%s -> resultado cacheado", clave
+                    )
+                    return cupos_pb2.LiberarResponse(estado=previa["estado"])
+
             cur = con.execute(
                 "UPDATE cursos SET cupos_libres = cupos_libres + 1 "
                 "WHERE curso_id = ? AND cupos_libres < cupos_totales",
@@ -170,6 +243,15 @@ class CuposServicer(cupos_pb2_grpc.CuposServicer):
                         grpc.StatusCode.FAILED_PRECONDITION,
                         "El curso ya tiene todos los cupos libres",
                     )
+
+            # registrar operacion
+            if clave:
+                con.execute(
+                    "INSERT INTO operaciones_idempotentes (clave, operacion, curso_id, estado) "
+                    "VALUES (?, 'liberar', ?, ?)",
+                    (clave, request.curso_id, estado),
+                )
+
         log.info(
             "liberar cupo curso=%s -> %s",
             request.curso_id,
@@ -181,7 +263,7 @@ class CuposServicer(cupos_pb2_grpc.CuposServicer):
 def serve() -> None:
     init_db()
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=MAX_WORKERS))
-    cupos_pb2_grpc.add_CuposServicer_to_server(CuposServicer(), server)
+    cupos_pb2_grpc.add_CuposServicer_to_server(CuposService(), server)
     server.add_insecure_port(f"[::]:{PORT}")
     server.start()
     log.info(
