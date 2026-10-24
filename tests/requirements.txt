@@ -3,3 +3,4 @@ requests>=2.32
 grpcio>=1.64
 grpcio-tools>=1.64
 pyyaml>=6
+jsonschema>=4.21

@@ -6,9 +6,14 @@ Variable dependiente: latencia y status code de POST /v1/enrollments.
 Variables controladas: CUPOS_GRPC_TIMEOUT_SECONDS de matriculas-api (fijo
 durante toda una corrida), mismo curso, mismo hardware.
 
+Con el timeout en 2 s se esperan estas respuestas al superar el umbral: las primeras
+solicitudes terminan en 504 CUPOS_TIMEOUT (~2000 ms, resultado incierto); tras
+CUPOS_CB_FAILURE_THRESHOLD fallas el circuito pasa a OPEN y el resto termina en
+503 CUPOS_NO_DISPONIBLE casi al instante (fail-fast).
+
 Uso (una corrida por valor de CUPOS_GRPC_TIMEOUT_SECONDS que se quiera
 comparar -- por defecto usa el que ya tenga matriculas-api corriendo):
-  python experiment/scripts/timeout.py --label timeout2s
+  python experiment/scripts/timeout.py --label timeout2s --reps 3
   # cambiar CUPOS_GRPC_TIMEOUT_SECONDS en .env, `docker compose up -d --build matriculas-api`
   python experiment/scripts/timeout.py --label timeout5s
 """
@@ -23,7 +28,10 @@ from datetime import datetime
 from _common import ROOT, compose, crear_estudiante, health, matricular, revertir
 
 ESCENARIOS_MS = [0, 250, 1000, 1500, 1900, 2050, 2500, 4000]
-CURSOS = [1, 2, 3, 5, 10, 20]
+# Cinco cursos reales y un id inexistente (999) que aparece cada 6 solicitudes: es un
+# error funcional conocido (404 CURSO_NO_ENCONTRADO) usado como control; con 25
+# solicitudes por escenario resultan 21 respuestas "normales" y 4 × 404.
+CURSOS = [1, 2, 3, 4, 5, 999]
 ESPERA_API_S = 30
 
 
@@ -62,28 +70,32 @@ def main():
     ap.add_argument("--label", required=True)
     ap.add_argument("--n", type=int, default=25,
                     help="peticiones por escenario; se recomienda al menos 25")
+    ap.add_argument("--reps", type=int, default=1,
+                    help="repeticiones completas del barrido (se recomiendan 3 o más)")
     a = ap.parse_args()
 
     out = ROOT / "experiment" / "data" / "raw" / f"{a.label}_{datetime.now():%Y%m%d_%H%M%S}.csv"
     try:
         with open(out, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["label", "delay_ms", "iter", "status", "latency_ms", "error_code", "circuit_state"])
-            for delay in ESCENARIOS_MS:
-                fijar_latencia(delay)
-                resultados = []
-                for i in range(a.n):
-                    estudiante = crear_estudiante()
-                    curso = CURSOS[i % len(CURSOS)]
-                    status, ms, body = matricular(estudiante, curso)
-                    error_code = body.get("error", {}).get("code", "") if isinstance(body, dict) else ""
-                    circuit_state = health().get("dependencies", {}).get("cupos_grpc", {}).get("circuit_state", "")
-                    resultados.append((status, ms, circuit_state))
-                    w.writerow([a.label, delay, i, status, f"{ms:.2f}", error_code, circuit_state])
-                    f.flush()
-                    if status == 201:
-                        revertir(body["id"])
-                resumen(delay, resultados)
+            w.writerow(["label", "rep", "delay_ms", "iter", "status", "latency_ms", "error_code", "circuit_state"])
+            for rep in range(1, a.reps + 1):
+                print(f"--- repetición {rep}/{a.reps} ---")
+                for delay in ESCENARIOS_MS:
+                    fijar_latencia(delay)
+                    resultados = []
+                    for i in range(a.n):
+                        estudiante = crear_estudiante()
+                        curso = CURSOS[i % len(CURSOS)]
+                        status, ms, body = matricular(estudiante, curso)
+                        error_code = body.get("error", {}).get("code", "") if isinstance(body, dict) else ""
+                        circuit_state = health().get("dependencies", {}).get("cupos_grpc", {}).get("circuit_state", "")
+                        resultados.append((status, ms, circuit_state))
+                        w.writerow([a.label, rep, delay, i, status, f"{ms:.2f}", error_code, circuit_state])
+                        f.flush()
+                        if status == 201:
+                            revertir(body["id"])
+                    resumen(delay, resultados)
     finally:
         fijar_latencia(0)
     print("datos:", out)

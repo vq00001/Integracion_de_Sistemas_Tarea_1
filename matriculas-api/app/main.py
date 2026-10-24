@@ -6,6 +6,7 @@ from fastapi.openapi.utils import get_openapi
 from .config import settings
 from .database import init_db
 from .errors import register_exception_handlers
+from .reconciler import Conciliador
 from .routers import enrollments, health, students
 
 DESCRIPTION = """
@@ -27,12 +28,24 @@ Todas las respuestas de error usan el mismo formato JSON:
 {"error": {"code": "SIN_CUPOS", "message": "...", "details": null}}
 ```
 
+### Idempotencia
+`POST /v1/enrollments` acepta la cabecera `Idempotency-Key`. Reintentar con la
+misma clave devuelve la misma matrícula y nunca consume un segundo cupo.
+
 ### Disponibilidad de Cupos
-Si el servicio gRPC de Cupos está caído, lento, o su circuit breaker está
-abierto, los endpoints que dependen de él (`POST /v1/enrollments`,
-`POST /v1/enrollments/{id}/revert`) responden `503 Service Unavailable`
-con `Retry-After`, sin registrar una matrícula inconsistente. La lectura
-de datos ya existentes (estudiantes y matrículas) no se ve afectada.
+Los endpoints que dependen de Cupos (`POST /v1/enrollments`,
+`POST /v1/enrollments/{id}/revert`) distinguen tres fallas de la dependencia:
+
+* `504 Gateway Timeout`: Cupos no respondió a tiempo. El resultado es
+  **incierto**; la matrícula queda `PENDIENTE` y se concilia (ver más abajo).
+* `503 Service Unavailable`: Cupos caído o circuito abierto (falla rápida).
+  Incluye `Retry-After`.
+* `502 Bad Gateway`: Cupos respondió con un error interno inesperado.
+
+Una matrícula `PENDIENTE` se resuelve reintentando con la misma
+`Idempotency-Key` (dentro de la ventana de reintento) o, si no se reintenta, el
+conciliador la anula y libera el cupo. La lectura de datos ya existentes
+(estudiantes y matrículas) no se ve afectada por una caída de Cupos.
 """
 
 app = FastAPI(
@@ -49,9 +62,22 @@ app.include_router(students.router)
 app.include_router(enrollments.router)
 
 
+_conciliador: Conciliador | None = None
+
+
 @app.on_event("startup")
 def on_startup() -> None:
+    global _conciliador
     init_db()
+    if settings.reconcile_interval_seconds > 0:
+        _conciliador = Conciliador(settings.reconcile_interval_seconds)
+        _conciliador.start()
+
+
+@app.on_event("shutdown")
+def on_shutdown() -> None:
+    if _conciliador is not None:
+        _conciliador.detener()
 
 
 def custom_openapi():

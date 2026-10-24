@@ -4,7 +4,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, DateTime, Enum, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import CheckConstraint, DateTime, Enum, ForeignKey, Index, Integer, String, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -15,9 +15,14 @@ def _uuid() -> str:
 
 
 class EstadoMatricula(str, enum.Enum):
+    PENDIENTE = "PENDIENTE"     # Intención registrada; aún no se sabe el resultado en Cupos
     CONFIRMADA = "CONFIRMADA"   # Cupos confirmó disponibilidad y el cupo quedó ocupado
-    RECHAZADA = "RECHAZADA"     # Cupos indicó que no había cupos (o el curso no existe)
-    ANULADA = "ANULADA"         # La matrícula fue revertida y el cupo fue liberado
+    RECHAZADA = "RECHAZADA"     # Reservado (hoy los rechazos definitivos no se persisten)
+    ANULADA = "ANULADA"         # Revertida por el usuario o cerrada por el conciliador; el cupo quedó libre
+
+
+# Estados "activos": ocupan (o podrían estar ocupando) un cupo del curso.
+ESTADOS_ACTIVOS_SQL = "estado IN ('PENDIENTE','CONFIRMADA')"
 
 
 class Student(Base):
@@ -51,12 +56,22 @@ class Enrollment(Base):
 
     __tablename__ = "enrollments"
     __table_args__ = (
-        UniqueConstraint(
-            "student_id", "curso_id", "estado",
-            name="uq_student_curso_estado_activo",
+        # Un estudiante no puede tener dos matrículas ACTIVAS (pendiente o
+        # confirmada) en el mismo curso. El índice es PARCIAL: las filas
+        # ANULADAS no cuentan, así que matricular → revertir → matricular →
+        # revertir deja dos filas ANULADAS sin conflicto. (La restricción
+        # anterior incluía `estado` en la clave única y bloqueaba la segunda
+        # anulación.) Además, la base de datos es quien decide la carrera
+        # entre peticiones simultáneas: solo una inserción puede ganar.
+        Index(
+            "uq_matricula_activa", "student_id", "curso_id", unique=True,
+            postgresql_where=text(ESTADOS_ACTIVOS_SQL),
+            sqlite_where=text(ESTADOS_ACTIVOS_SQL),
         ),
+        # Clave de idempotencia entregada por el cliente (cabecera Idempotency-Key).
+        Index("uq_matricula_client_key", "client_key", unique=True),
         CheckConstraint(
-            "estado IN ('CONFIRMADA','RECHAZADA','ANULADA')", name="ck_estado_valido"
+            "estado IN ('PENDIENTE','CONFIRMADA','RECHAZADA','ANULADA')", name="ck_estado_valido"
         ),
     )
 
@@ -69,11 +84,15 @@ class Enrollment(Base):
         Enum(EstadoMatricula, native_enum=False, length=20), nullable=False
     )
     motivo: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    # Clave de idempotencia enviada a Cupos (ocuparCupo / liberarCupo).
-    # Se reutiliza el propio id de la matrícula: así, si el proceso se cae
-    # después de llamar a Cupos pero antes de confirmar en la BD local,
-    # un reintento con el mismo id no duplica la ocupación del cupo.
+    # Clave de idempotencia enviada a Cupos (ocuparCupo / liberarCupo). Es un
+    # UUID interno, opaco y estable para esta matrícula: no contiene datos
+    # personales. Como la fila se inserta ANTES de llamar a Cupos, cualquier
+    # reintento (del cliente o del conciliador) reutiliza la misma clave y
+    # Cupos no ocupa ni libera el cupo dos veces.
     idempotency_key: Mapped[str] = mapped_column(String(36), nullable=False, default=_uuid)
+    # Cabecera Idempotency-Key enviada por el cliente de la API REST (opcional).
+    # Si el cliente reintenta con la misma clave, recibe la misma matrícula.
+    client_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow

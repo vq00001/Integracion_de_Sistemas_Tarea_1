@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 from .models import EstadoMatricula
+from .rut import normalizar_rut
 
 # ---------------------------------------------------------------------------
 # Estudiantes
@@ -17,6 +18,12 @@ class StudentCreate(BaseModel):
     apellido: str = Field(..., min_length=1, max_length=150, examples=["Pérez"])
     email: EmailStr = Field(..., examples=["ana.perez@example.com"])
     telefono: str | None = Field(None, max_length=20, examples=["+56912345678"])
+
+    @field_validator("rut")
+    @classmethod
+    def _validar_rut(cls, valor: str) -> str:
+        # Se guarda en formato canónico (sin puntos, con guion y DV en mayúscula)
+        return normalizar_rut(valor)
 
 
 class StudentOut(BaseModel):

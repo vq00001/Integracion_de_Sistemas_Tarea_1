@@ -1,5 +1,7 @@
 # D1 - Estilo de integración y descomposición
 
+**Estado:** aceptada (revisada tras la evaluación: se agrega el análisis de los datos duplicados).
+
 El Centro de Formación Técnica AprendeMás opera dos sistemas que nacieron y evolucionaron de manera independiente: *Cupos*, responsable de administrar cursos y disponibilidad, y *Matrículas*, encargado del registro de estudiantes y matrículas. Para confirmar una matrícula, Matrículas necesita consultar frecuentemente el estado de los cupos disponibles y actualizar dicha información de forma consistente.
 
 El problema principal de diseño consiste en determinar si ambos dominios deben integrarse como una única aplicación o mantenerse separados mediante mecanismos de comunicación explícitos.
@@ -28,3 +30,21 @@ Finalmente, las responsabilidades quedan definidas de la siguiente forma:
 
 
 Matrículas consulta siempre a Cupos mediante los contratos definidos y nunca accede directamente a su base de datos.
+
+## Datos duplicados a propósito y su costo
+
+Separar los servicios obliga a que cada uno guarde las referencias que necesita del otro. La duplicación es deliberada y se limita a lo mínimo:
+
+| Dato | Dónde vive la verdad | Dónde se duplica | Por qué se duplica |
+|---|---|---|---|
+| Identificador del curso (`curso_id`) | Cupos (catálogo y cupos) | Columna `curso_id` de cada matrícula en Matrículas, **sin clave foránea** | Una matrícula debe saber a qué curso pertenece para poder consultarlo y liberar su cupo. Matrículas no tiene tabla de cursos: no administra el catálogo. |
+| Clave de idempotencia de la operación | Matrículas (la genera) | Registro de operaciones procesadas en Cupos (`operaciones_idempotentes`) | Permite reintentar ocupar o liberar sin duplicar el efecto. Es un UUID opaco, no contiene datos personales. |
+| Estado de la ocupación (cupo retenido sí/no) | Cupos | Estado de la matrícula (`PENDIENTE`/`CONFIRMADA`/`ANULADA`) en Matrículas | La matrícula refleja el resultado de la operación en Cupos para responder consultas sin llamarlo. |
+
+**Costos aceptados de esta duplicación.**
+
+- *Referencia colgante:* si un curso se elimina o se renumera en Cupos, las matrículas existentes conservan un `curso_id` que ya no significa lo mismo. Matrículas no puede detectarlo por sí sola: valida el curso solo en el momento de matricular, consultando a Cupos. Mitigación: el contrato establece que los `curso_id` de Cupos son estables y no se reutilizan.
+- *Dos fuentes que pueden divergir:* el cupo puede quedar retenido en Cupos mientras Matrículas no tiene una matrícula confirmada (por ejemplo, tras un timeout). Esto no se ignora: se modela con el estado `PENDIENTE` y se corrige con un conciliador (ver D4), en lugar de suponer que ambos estados siempre coinciden.
+- *Sin transacción distribuida:* no existe una transacción entre las dos bases de datos. La consistencia se obtiene con una secuencia de pasos idempotentes y compensables (saga), no con atomicidad.
+
+**Qué se revisaría si cambia el contexto.** Si el catálogo de cursos pasara a tener cambios frecuentes (renombres, bajas), convendría que Cupos publicara eventos de cambio y que Matrículas mantuviera una copia de solo lectura del catálogo, aceptando consistencia eventual en esa parte.

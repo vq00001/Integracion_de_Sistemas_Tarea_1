@@ -19,7 +19,8 @@ pip install -r tests/requirements.txt
 
 A medida que aumenta la latencia de Cupos, la latencia de
 `POST /v1/enrollments` aumenta hasta alcanzar `CUPOS_GRPC_TIMEOUT_SECONDS`.
-A partir de ese punto, Matrículas-API corta la espera y responde `503`.
+A partir de ese punto, Matrículas-API corta la espera y responde `504 CUPOS_TIMEOUT`; tras
+las fallas consecutivas el circuito abre y responde `503` casi al instante.
 
 ### Variables
 
@@ -76,3 +77,21 @@ python experiment/scripts/throughput.py
 
 El punto de saturación se identifica cuando el `rps` deja de aumentar o el
 `p95` se eleva considerablemente al subir la concurrencia. -->
+
+## Datos crudos y repeticiones
+
+Los CSV de cada corrida se guardan en `experiment/data/raw/` y **sí se versionan** (el
+`.gitignore` ignora `*.csv` en general, pero excluye esa carpeta). Los scripts aceptan
+`--reps N` para repetir el barrido completo; se recomiendan 3 repeticiones como mínimo, y
+el graficador reporta media y desviación estándar entre repeticiones.
+
+## Experimento 2: consistencia de los cupos tras un timeout
+
+```bash
+python experiment/scripts/consistencia.py --label consistencia --reps 3
+python experiment/graficar_experimentos.py experiment/data/raw/<timeout>.csv experiment/data/raw/<consistencia>.csv
+```
+
+Mide cuántos cupos quedan retenidos en Cupos sin una matrícula confirmada ("huérfanos")
+cuando se vence el timeout, con y sin conciliador. Las hipótesis, variables y el
+procedimiento están en el encabezado del script.

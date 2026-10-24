@@ -1,5 +1,6 @@
-# Override para tests: publica el puerto gRPC de Cupos en el host (solo local).
+# Override para tests: publica el puerto gRPC de Cupos SOLO en el loopback del host
+# (127.0.0.1), nunca en todas las interfaces.
 services:
   cupos:
     ports:
-      - "50051:50051"
+      - "127.0.0.1:50051:50051"

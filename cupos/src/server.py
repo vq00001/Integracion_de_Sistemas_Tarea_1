@@ -51,6 +51,32 @@ def conexion():
         con.close()
 
 
+@contextmanager
+def transaccion_escritura():
+    """Transacción de escritura serializada (BEGIN IMMEDIATE).
+
+    Adquiere el candado de escritura de SQLite ANTES de leer la tabla de
+    operaciones idempotentes. Así, dos llamadas simultáneas con la misma
+    clave no pueden ambas ver "clave no registrada": la segunda espera a que
+    la primera haga COMMIT y entonces encuentra el resultado guardado y lo
+    devuelve. Sin esto, la segunda llamada descontaba el cupo, chocaba con la
+    clave primaria al registrar la operación y llegaba al cliente como un
+    error UNKNOWN (que la API trataba como falla de Cupos).
+    """
+    con = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        yield con
+        con.execute("COMMIT")
+    except BaseException:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        raise
+    finally:
+        con.close()
+
+
 def init_db() -> None:
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     with conexion() as con:
@@ -160,8 +186,8 @@ class CuposService(cupos_pb2_grpc.CuposServicer):
         self._simular_latencia()
 
         clave = request.idempotency_key
-        with conexion() as con:
-            if clave:  # revisar que no sea un request repetido:with
+        with transaccion_escritura() as con:
+            if clave:  # revisar que no sea un request repetido
                 previa = con.execute(
                     "SELECT estado FROM operaciones_idempotentes "
                     "WHERE clave = ? AND operacion = 'ocupar' AND curso_id = ?",
@@ -211,7 +237,7 @@ class CuposService(cupos_pb2_grpc.CuposServicer):
         self._simular_latencia()
 
         clave = request.idempotency_key
-        with conexion() as con:
+        with transaccion_escritura() as con:
             if clave:  # checkear que no sea un mensaje repetido
                 previa = con.execute(
                     "SELECT estado FROM operaciones_idempotentes "

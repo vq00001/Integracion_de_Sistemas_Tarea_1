@@ -2,15 +2,9 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Matrículas API",
-    "description": "\nAPI REST del sistema de **Matrículas** del Centro de Formación Técnica AprendeMás.\n\nPermite gestionar estudiantes y sus matrículas. Antes de confirmar una\nmatrícula, valida en tiempo real la disponibilidad de cupos consultando\nal servicio **Cupos** a través de gRPC (contrato: `proto/cupos.proto`).\n\n### Autenticación\nTodos los endpoints de negocio requieren la cabecera `X-API-Key` con una\nAPI key válida (ver sección \"Autenticación\" del README para el porqué de\nesta elección).\n\n### Errores\nTodas las respuestas de error usan el mismo formato JSON:\n\n```json\n{\"error\": {\"code\": \"SIN_CUPOS\", \"message\": \"...\", \"details\": null}}\n```\n\n### Disponibilidad de Cupos\nSi el servicio gRPC de Cupos está caído, lento, o su circuit breaker está\nabierto, los endpoints que dependen de él (`POST /v1/enrollments`,\n`POST /v1/enrollments/{id}/revert`) responden `503 Service Unavailable`\ncon `Retry-After`, sin registrar una matrícula inconsistente. La lectura\nde datos ya existentes (estudiantes y matrículas) no se ve afectada.\n",
+    "description": "\nAPI REST del sistema de **Matrículas** del Centro de Formación Técnica AprendeMás.\n\nPermite gestionar estudiantes y sus matrículas. Antes de confirmar una\nmatrícula, valida en tiempo real la disponibilidad de cupos consultando\nal servicio **Cupos** a través de gRPC (contrato: `proto/cupos.proto`).\n\n### Autenticación\nTodos los endpoints de negocio requieren la cabecera `X-API-Key` con una\nAPI key válida (ver sección \"Autenticación\" del README para el porqué de\nesta elección).\n\n### Errores\nTodas las respuestas de error usan el mismo formato JSON:\n\n```json\n{\"error\": {\"code\": \"SIN_CUPOS\", \"message\": \"...\", \"details\": null}}\n```\n\n### Idempotencia\n`POST /v1/enrollments` acepta la cabecera `Idempotency-Key`. Reintentar con la\nmisma clave devuelve la misma matrícula y nunca consume un segundo cupo.\n\n### Disponibilidad de Cupos\nLos endpoints que dependen de Cupos (`POST /v1/enrollments`,\n`POST /v1/enrollments/{id}/revert`) distinguen tres fallas de la dependencia:\n\n* `504 Gateway Timeout`: Cupos no respondió a tiempo. El resultado es\n  **incierto**; la matrícula queda `PENDIENTE` y se concilia (ver más abajo).\n* `503 Service Unavailable`: Cupos caído o circuito abierto (falla rápida).\n  Incluye `Retry-After`.\n* `502 Bad Gateway`: Cupos respondió con un error interno inesperado.\n\nUna matrícula `PENDIENTE` se resuelve reintentando con la misma\n`Idempotency-Key` (dentro de la ventana de reintento) o, si no se reintenta, el\nconciliador la anula y libera el cupo. La lectura de datos ya existentes\n(estudiantes y matrículas) no se ve afectada por una caída de Cupos.\n",
     "version": "1.0.0"
   },
-  "servers": [
-    {
-      "url": "http://localhost:8000",
-      "description": "Entorno local / docker compose"
-    }
-  ],
   "paths": {
     "/v1/health": {
       "get": {
@@ -78,6 +72,16 @@
               }
             }
           },
+          "401": {
+            "description": "Falta la API key o es inválida",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "409": {
             "description": "RUT o email ya registrados",
             "content": {
@@ -89,11 +93,11 @@
             }
           },
           "422": {
-            "description": "Validation Error",
+            "description": "Datos inválidos (p. ej. RUT con dígito verificador incorrecto)",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -181,6 +185,16 @@
               }
             }
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -244,6 +258,16 @@
               }
             }
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
           "404": {
             "content": {
               "application/json": {
@@ -278,9 +302,29 @@
           "Matrículas"
         ],
         "summary": "Matricular a un estudiante en un curso",
-        "description": "Registra la matrícula solo si el curso tiene cupos disponibles según el servicio de Cupos (verificado en tiempo real vía gRPC, de forma atómica: se consulta y se reserva el cupo en una sola llamada).",
+        "description": "Registra la matrícula solo si el curso tiene cupos disponibles según el servicio de Cupos (verificado en tiempo real vía gRPC; consulta y reserva son una sola llamada atómica).\n\n**Idempotencia.** Envía una cabecera `Idempotency-Key` (p. ej. un UUID) para poder reintentar con seguridad: repetir la solicitud con la misma clave devuelve la misma matrícula (cabecera `Idempotent-Replayed: true`) y nunca consume un segundo cupo. Una clave identifica un intento; reutilizarla con otro estudiante o curso da 422.\n\n**Resultado incierto (504).** Si Cupos no responde a tiempo, el cupo pudo haberse ocupado. La matrícula queda `PENDIENTE`: reintenta con la misma clave o consulta `GET /v1/enrollments/{id}`. Si no se confirma dentro del TTL, se anula automáticamente y se libera el cupo.",
         "operationId": "matricular_v1_enrollments_post",
         "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Identifica este intento para poder reintentarlo sin duplicar el cupo.",
+              "title": "Idempotency-Key"
+            },
+            "description": "Identifica este intento para poder reintentarlo sin duplicar el cupo."
+          },
           {
             "name": "X-API-Key",
             "in": "header",
@@ -319,6 +363,16 @@
               }
             }
           },
+          "401": {
+            "description": "Falta la API key o es inválida",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Estudiante o curso no existen",
             "content": {
@@ -330,17 +384,7 @@
             }
           },
           "409": {
-            "description": "Ya matriculado o sin cupos",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "Cupos no disponible",
+            "description": "Ya matriculado, matrícula en proceso o sin cupos",
             "content": {
               "application/json": {
                 "schema": {
@@ -350,11 +394,41 @@
             }
           },
           "422": {
-            "description": "Validation Error",
+            "description": "Datos inválidos o Idempotency-Key reutilizada con otra solicitud",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Cupos devolvió un error interno",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Cupos no disponible (caído o circuito abierto)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Cupos no respondió a tiempo: resultado incierto, matrícula PENDIENTE",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -472,6 +546,16 @@
               }
             }
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -535,6 +619,16 @@
               }
             }
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
           "404": {
             "content": {
               "application/json": {
@@ -546,7 +640,7 @@
             "description": "Not Found"
           },
           "409": {
-            "description": "La matrícula ya estaba anulada",
+            "description": "La matrícula ya estaba anulada o aún está pendiente",
             "content": {
               "application/json": {
                 "schema": {
@@ -555,8 +649,28 @@
               }
             }
           },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
           "503": {
             "description": "Cupos no disponible",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Cupos no respondió a tiempo",
             "content": {
               "application/json": {
                 "schema": {
@@ -627,6 +741,16 @@
                 }
               }
             }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
           },
           "404": {
             "content": {
@@ -816,6 +940,7 @@
       "EstadoMatricula": {
         "type": "string",
         "enum": [
+          "PENDIENTE",
           "CONFIRMADA",
           "RECHAZADA",
           "ANULADA"

@@ -9,9 +9,16 @@ services:
     volumes:
       - cupos_data:/data            # BD propia del servicio (T5)
     expose:
-      - "50051"                     # no publicar al exterior
-    ports:
-      - "50051:50051"               # para pruebas locales
+      - "50051"                     # solo visible para otros servicios del compose (red interna)
+    # Sin `ports:` a propósito: el gRPC de Cupos es interno y no se publica en el host.
+    # Para las pruebas de contrato se publica solo en 127.0.0.1 (docker-compose.test.yml).
+    healthcheck:
+      # El canal gRPC debe poder conectarse; así la API solo arranca cuando Cupos está listo.
+      test: ["CMD", "python", "-c", "import grpc; ch = grpc.insecure_channel('localhost:50051'); grpc.channel_ready_future(ch).result(timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
 
   matriculas-db:
     image: postgres:16-alpine
@@ -24,8 +31,8 @@ services:
       - matriculas_db_data:/var/lib/postgresql/data   # BD propia del servicio (T5), igual que cupos_data
     expose:
       - "5432"                      # solo visible para otros servicios del compose
-    ports:
-      - "5432:5432"                 # para pruebas locales (psql, etc.) - quitar en un despliegue real
+    # Sin `ports:`: la base contiene datos personales y no debe ser accesible desde fuera del
+    # compose. Para inspeccionarla: docker compose exec matriculas-db psql -U matriculas_user -d matriculas_db
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${MATRICULAS_DB_USER:-matriculas_user} -d ${MATRICULAS_DB_NAME:-matriculas_db}"]
       interval: 5s
@@ -63,14 +70,16 @@ services:
       CUPOS_GRPC_TIMEOUT_SECONDS: ${CUPOS_GRPC_TIMEOUT_SECONDS:-2.0}
       CUPOS_CB_FAILURE_THRESHOLD: ${CUPOS_CB_FAILURE_THRESHOLD:-5}
       CUPOS_CB_RECOVERY_SECONDS: ${CUPOS_CB_RECOVERY_SECONDS:-15.0}
+      PENDING_TTL_SECONDS: ${PENDING_TTL_SECONDS:-30}
+      RECONCILE_INTERVAL_SECONDS: ${RECONCILE_INTERVAL_SECONDS:-10}
       API_KEYS: ${MATRICULAS_API_KEYS:-dev-matriculas-key-123}
     ports:
-      - "8000:8000"                 # API pública
+      - "8000:8000"                 # API pública: el único puerto publicado del sistema
     depends_on:
       matriculas-db:
         condition: service_healthy
       cupos:
-        condition: service_started
+        condition: service_healthy
 
 volumes:
   cupos_data:

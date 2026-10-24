@@ -21,9 +21,12 @@ defecto.
 ```
 .
 ├── docker-compose.yml     # orquesta TODOS los servicios (cupos + matriculas-db + matriculas-api [+ matriculas, legacy])
-├── .env.example
+├── .env.example           # plantilla de configuración (el .env real NO se versiona)
 ├── proto/
-│   └── cupos.proto          # contrato gRPC de Cupos (fuente de verdad de la integración)
+│   └── cupos.proto          # contrato gRPC de Cupos, paquete cupo.v1 (fuente de verdad de la integración)
+├── docs/adr/                # ADR D1–D4 + D5 (autenticación)
+├── experiment/              # scripts, datos crudos (data/raw) y figuras de los experimentos
+├── tests/                   # grpc/, integration/ y contract/
 ├── cupos/                   # servicio Cupos (Python + gRPC + SQLite) - sin cambios
 │   ├── Dockerfile
 │   ├── requirements.txt
@@ -34,11 +37,15 @@ defecto.
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   ├── README.md             # autenticación, resiliencia, endpoints, cómo correrla
+│   ├── generar_stubs.py / exportar_openapi.py
+│   └── docs/openapi.{json,yaml}   # contrato REST versionado
 │   └── app/
 │       ├── main.py, config.py, database.py, models.py, schemas.py
 │       ├── security.py       # autenticación por API Key
 │       ├── errors.py         # errores JSON uniformes
 │       ├── grpc_client.py + circuit_breaker.py  # cliente gRPC resiliente hacia Cupos
+│       ├── reconciler.py     # cierra matrículas PENDIENTES (resultado incierto tras un timeout)
+│       ├── rut.py            # validación del RUT (módulo 11)
 │       └── routers/          # students, enrollments, health
 └── matriculas/               # CLI legado (Node.js + Postgres) - "antes de la integración"
     ├── Dockerfile
@@ -63,21 +70,28 @@ llevan el prefijo del servicio (`cupos/...`, `matriculas/...`).
 ### Matrículas no tiene tabla de cursos
 
 Matrículas registra estudiantes y sus matrículas — no el catálogo de
-cursos, que le pertenece a Cupos. Por eso `Enrollment` no tiene una
-foreign key a ninguna tabla `Course` local: guarda directamente
-`codigo_curso`, un texto libre (ej. `"PY-101"`) que quien matricula
-escribe, sin validar contra nada. Es intencional: refleja el estado real
-descrito en el enunciado, donde Matrículas "se matricula sin verificar
-cupos" porque ni siquiera tiene forma de verificar que el curso exista.
+cursos, que le pertenece a Cupos. Por eso no hay una foreign key a una tabla
+`Course` local. En la **API integrada**, cada matrícula guarda el `curso_id`
+de Cupos (dato duplicado a propósito; ver `docs/adr/D1-...`) y valida que el
+curso exista en el momento de matricular, consultando a Cupos. El **CLI legado**
+(`matriculas/`), en cambio, guarda `codigo_curso`, un texto libre (ej.
+`"PY-101"`) sin validar contra nada: refleja el estado "antes de la integración"
+descrito en el enunciado.
 
 ## Instrucciones de ejecución
 
 ### Levantar la integración completa (Cupos + Matrículas API)
 
 ```bash
-cp .env.example .env
 docker compose up --build -d cupos matriculas-db matriculas-api
 ```
+
+(`.env` es opcional; sin él se usan los valores por defecto de desarrollo.
+Para personalizarlos: `cp .env.example .env`. Ese archivo no se versiona.)
+
+Solo el puerto `8000` (API pública) se publica en el host. El gRPC de Cupos y
+Postgres son internos y no se exponen; para inspeccionar la base:
+`docker compose exec matriculas-db psql -U matriculas_user -d matriculas_db`.
 
 La API REST de Matrículas queda en `http://localhost:8000` (docs en
 `/docs`). Ver `matriculas-api/README.md` para ejemplos de uso con
@@ -110,60 +124,50 @@ docker compose up --build cupos
 
 ## Tests
 
-La suite de pruebas valida el contrato gRPC de Cupos, los endpoints REST de
-Matrículas, la autenticación, el manejo de errores, la reserva y liberación
-de cupos, la idempotencia y el comportamiento cuando Cupos no está
-disponible.
+La suite valida el contrato gRPC de Cupos, los endpoints REST de Matrículas, la
+autenticación, el manejo de errores, la reserva y liberación de cupos, la
+**consistencia ante concurrencia**, la **idempotencia**, el comportamiento
+cuando Cupos está caído o lento, y el **contrato OpenAPI** (O4).
 
 ### Requisitos
 
-Instala las dependencias de pruebas en el entorno virtual del proyecto:
-
 ```bash
 python -m pip install -r tests/requirements.txt
+docker compose -f docker-compose.yml -f docker-compose.test.yml up --build -d cupos matriculas-db matriculas-api
 ```
 
-Levanta los servicios antes de ejecutar las pruebas:
+(El archivo `docker-compose.test.yml` publica el gRPC de Cupos solo en
+`127.0.0.1:50051` para las pruebas de contrato.)
+
+### Ejecutar
 
 ```bash
-docker compose up --build -d cupos matriculas-db matriculas-api
+python -m pytest tests -m "not falla" -q     # pruebas normales (42)
+python -m pytest tests -m falla -q           # detienen/reinician contenedores (6), sin paralelismo
+python -m pytest tests -q                    # todas (48)
 ```
 
-### Ejecutar la suite completa
+Por categoría: `tests/grpc`, `tests/integration`, `tests/contract`, o por
+marcador (`-m grpc`).
 
-Desde la raíz del repositorio:
+## Historial de versiones del contrato
 
-```bash
-python -m pytest tests -q
-```
+| Fecha | Contrato | Cambio | Clasificación |
+|---|---|---|---|
+| 2026-09-25 | REST `/v1`, gRPC `cupo` | Versión inicial | — |
+| 2026-10-21 | gRPC `cupo` → **`cupo.v1`** | Se versiona el `package` | Cambio de nombre del servicio; ambos extremos se regeneran juntos (aún sin consumidores externos) |
+| 2026-10-21 | REST `/v1` | Cabecera opcional `Idempotency-Key`; estado `PENDIENTE`; respuestas `502`/`504`; clave inválida `403`→`401`; RUT validado | Ver tabla en `docs/adr/D3-...` |
 
-### Ejecutar por categoría
+## Declaración de uso de asistentes de IA
 
-Solo contrato gRPC:
+> **Completar antes de entregar.** El encargo exige declarar qué se usó, para qué y qué se
+> verificó, y que cada integrante pueda explicar cualquier línea de código en la defensa.
 
-```bash
-python -m pytest tests/grpc -q
-```
-
-Solo API REST e integración:
-
-```bash
-python -m pytest tests/integration -q
-```
-
-Solo las pruebas de integración con gRPC:
-
-```bash
-python -m pytest -m grpc tests -q
-```
-
-Las pruebas marcadas como `falla` detienen y reinician el contenedor `cupos`.
-Ejecútalas sin paralelismo y con Docker disponible:
-
-```bash
-python -m pytest -m falla tests -q
-```
-
-La suite completa tiene actualmente **28 pruebas**. El resultado esperado es
-`28 passed` cuando los servicios están levantados y la base de datos de Cupos
-está disponible.
+- **Herramienta:** Claude (Anthropic).
+- **Para qué se usó:** apoyo en la dockerización, implementación de la suite de pruebas y en los scripts del experimento. 
+  Además, tras la evaluación, en el diseño e implementación de las correcciones de consistencia
+  (matrícula en dos pasos, idempotencia, conciliador) y de seguridad (401, validación de
+  RUT, puertos, secretos).
+- **Qué se verificó:** el código modificado se ejecutó contra Cupos y la API reales, con la
+  suite completa (48 pruebas) sobre SQLite y PostgreSQL, incluyendo la migración de una
+  base existente. Los datos del informe provienen de las corridas del propio grupo.

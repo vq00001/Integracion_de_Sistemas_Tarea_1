@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from .. import models, schemas
 from ..database import get_db
 from ..errors import ConflictError, NotFoundError
+from ..rut import normalizar_rut
 from ..security import require_api_key
 
 router = APIRouter(
@@ -22,7 +23,11 @@ router = APIRouter(
     response_model=schemas.StudentOut,
     status_code=status.HTTP_201_CREATED,
     summary="Crear un estudiante",
-    responses={409: {"model": schemas.ErrorResponse, "description": "RUT o email ya registrados"}},
+    responses={
+        401: {"model": schemas.ErrorResponse, "description": "Falta la API key o es inválida"},
+        409: {"model": schemas.ErrorResponse, "description": "RUT o email ya registrados"},
+        422: {"model": schemas.ErrorResponse, "description": "Datos inválidos (p. ej. RUT con dígito verificador incorrecto)"},
+    },
 )
 def crear_estudiante(payload: schemas.StudentCreate, db: Session = Depends(get_db)):
     estudiante = models.Student(**payload.model_dump())
@@ -42,7 +47,7 @@ def crear_estudiante(payload: schemas.StudentCreate, db: Session = Depends(get_d
     "/{student_id}",
     response_model=schemas.StudentOut,
     summary="Consultar un estudiante por id",
-    responses={404: {"model": schemas.ErrorResponse}},
+    responses={401: {"model": schemas.ErrorResponse}, 404: {"model": schemas.ErrorResponse}},
 )
 def obtener_estudiante(student_id: str, db: Session = Depends(get_db)):
     estudiante = db.get(models.Student, student_id)
@@ -55,6 +60,7 @@ def obtener_estudiante(student_id: str, db: Session = Depends(get_db)):
     "",
     response_model=schemas.StudentPage,
     summary="Listar estudiantes",
+    responses={401: {"model": schemas.ErrorResponse}},
 )
 def listar_estudiantes(
     db: Session = Depends(get_db),
@@ -64,6 +70,10 @@ def listar_estudiantes(
 ):
     stmt = select(models.Student)
     if rut:
+        try:
+            rut = normalizar_rut(rut)  # el RUT se guarda normalizado: buscar "12.345.678-5" también funciona
+        except ValueError:
+            pass  # valor inválido: simplemente no coincidirá con ningún estudiante
         stmt = stmt.where(models.Student.rut == rut)
     total_count = len(db.execute(stmt).all())
     items = (

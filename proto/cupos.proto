@@ -1,6 +1,16 @@
 syntax = "proto3";
 
-package cupo;
+// Contrato gRPC de Cupos, versión 1.
+//
+// Política de versionado (ver docs/adr/D3-contrato-versionado-y-evolucion.md):
+//  - Cambios compatibles (campo nuevo con número nuevo, valor nuevo de enum,
+//    campo eliminado con su número en `reserved`) se hacen DENTRO de cupo.v1.
+//  - Cambios incompatibles (reutilizar un número de campo, cambiar un tipo,
+//    renombrar o eliminar un RPC) exigen un paquete nuevo (cupo.v2) que
+//    convive con v1 hasta que todos los consumidores migren.
+// El nombre completo del servicio (/cupo.v1.Cupos/...) viaja en cada llamada,
+// por lo que un cliente v1 y un servidor v2 no se confunden entre sí.
+package cupo.v1;
 
 service Cupos {
 

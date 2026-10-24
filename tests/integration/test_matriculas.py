@@ -1,7 +1,9 @@
 """Flujo funcional de la API REST (T2, T6) y su integración con Cupos."""
+import uuid
+
 import pytest
 
-from tests.conftest import CURSO_CON_CUPO
+from tests.conftest import CURSO_CON_CUPO, rut_valido
 
 
 # ---------- T2: versionado, semántica HTTP, errores JSON ----------
@@ -49,9 +51,39 @@ def test_sin_credenciales_da_401(api_sin_auth):
 
 
 def test_credenciales_invalidas_dan_401(api):
-    """Comprueba que una API key inválida es rechazada con 403."""
+    """Una API key inválida no autentica: 401 (403 se reservaría para un cliente
+    autenticado sin permiso, y esta API no tiene roles)."""
     r = api.get("/v1/students", headers={"X-API-Key": "clave-incorrecta"})
-    assert r.status_code == 403
+    assert r.status_code == 401
+    assert r.headers["www-authenticate"] == "ApiKey"
+    assert r.json()["error"]["code"] == "UNAUTHORIZED"
+
+
+# ---------- Validación del RUT (calidad del dato personal) ----------
+
+def _alumno(rut):
+    sufijo = uuid.uuid4().hex[:8]
+    return {"rut": rut, "nombre": "Ana", "apellido": "Test", "email": f"v{sufijo}@example.com"}
+
+
+@pytest.mark.parametrize("rut", ["abc", "12345678-9", "1234", "12.345.678", "99999999-X"])
+def test_rut_invalido_da_422(api, rut):
+    """Un RUT mal formado o con dígito verificador incorrecto se rechaza."""
+    r = api.post("/v1/students", json=_alumno(rut))
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "VALIDATION_ERROR"
+    # el error no devuelve de vuelta el dato personal enviado
+    assert "input" not in str(r.json()["error"]["details"])
+
+
+def test_rut_con_puntos_se_guarda_normalizado(api):
+    """12.345.678-5 y 12345678-5 son el mismo RUT: se almacena en formato canónico."""
+    canonico = rut_valido()
+    cuerpo, dv = canonico.split("-")
+    con_puntos = f"{int(cuerpo):,}".replace(",", ".") + "-" + dv.lower()
+    r = api.post("/v1/students", json=_alumno(con_puntos))
+    assert r.status_code == 201, r.text
+    assert r.json()["rut"] == canonico
 
 
 # ---------- Matrículas ----------
@@ -126,3 +158,12 @@ def test_matricular_y_revertir_mueve_el_cupo(api, estudiante, cupos_stub):
     api.post(f"/v1/enrollments/{m['id']}/revert")
     despues = stub.obtenerCupo(pb2.ObtenerRequest(curso_id=CURSO_CON_CUPO)).cupos_libres
     assert despues == antes
+
+
+def test_filtro_por_rut_acepta_el_formato_con_puntos(api, estudiante):
+    """El RUT se guarda normalizado; buscarlo con puntos y guion también lo encuentra."""
+    cuerpo, dv = estudiante["rut"].split("-")
+    con_puntos = f"{int(cuerpo):,}".replace(",", ".") + "-" + dv
+    r = api.get("/v1/students", params={"rut": con_puntos})
+    assert r.status_code == 200
+    assert [e["id"] for e in r.json()["items"]] == [estudiante["id"]]

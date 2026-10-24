@@ -18,6 +18,18 @@ CUPOS_GRPC_ADDR = os.getenv("CUPOS_GRPC_ADDR", "localhost:50051")
 COMPOSE_ARGS = os.getenv("COMPOSE_ARGS", "-f docker-compose.yml -f docker-compose.test.yml").split()
 
 
+def rut_valido(semilla: int | None = None) -> str:
+    """RUT chileno con dígito verificador correcto (la API valida el módulo 11)."""
+    cuerpo = str(semilla if semilla is not None else 10_000_000 + uuid.uuid4().int % 80_000_000)
+    suma, factor = 0, 2
+    for d in reversed(cuerpo):
+        suma += int(d) * factor
+        factor = 2 if factor == 7 else factor + 1
+    resto = 11 - suma % 11
+    dv = "0" if resto == 11 else "K" if resto == 10 else str(resto)
+    return f"{cuerpo}-{dv}"
+
+
 class Api:
     """Cliente HTTP mínimo con la API key por defecto."""
 
@@ -50,7 +62,7 @@ def estudiante(api) -> dict:
     """Estudiante nuevo y único por prueba (evita colisiones entre tests)."""
     sufijo = uuid.uuid4().hex[:8]
     payload = {
-        "rut": f"{sufijo[:8]}-{sufijo[-1]}",
+        "rut": rut_valido(),
         "nombre": f"Test {sufijo[:4]}",
         "apellido": "Api",
         "email": f"t{sufijo}@example.com",
@@ -102,6 +114,23 @@ def curso_lleno(cupos_stub):
         stub.liberarCupo(pb2.LiberarRequest(curso_id=CURSO_CAPACIDAD_BAJA, idempotency_key=f"teardown-{clave}"))
 
 
-def compose(*args: str) -> subprocess.CompletedProcess:
+def compose(*args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+    """Ejecuta `docker compose`. `env` agrega variables que compose sustituye en
+    docker-compose.yml (p. ej. SIMULAR_LATENCIA_MS)."""
     return subprocess.run(["docker", "compose", *COMPOSE_ARGS, *args], cwd=ROOT,
-                          check=True, capture_output=True, text=True)
+                          check=True, capture_output=True, text=True,
+                          env={**os.environ, **(env or {})})
+
+
+def esperar_api(api, segundos: float = 40) -> None:
+    """Espera a que la API responda tras reiniciarla."""
+    import time
+    limite = time.monotonic() + segundos
+    while time.monotonic() < limite:
+        try:
+            if requests.get(f"{api.base_url}/v1/health", timeout=2).status_code == 200:
+                return
+        except requests.RequestException:
+            pass
+        time.sleep(0.5)
+    raise RuntimeError("la API no volvió a responder")
