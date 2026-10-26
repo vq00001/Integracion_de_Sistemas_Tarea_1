@@ -1,3 +1,7 @@
+# Nombre fijo del proyecto: los contenedores 'tests' y 'experimentos' controlan los demás
+# servicios con `docker compose`, y necesitan apuntar exactamente al mismo proyecto.
+name: integracion-sistemas-t1
+
 services:
   cupos:
     build:
@@ -80,6 +84,46 @@ services:
         condition: service_healthy
       cupos:
         condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Ejecutores automáticos (no se levantan con `docker compose up`; solo con `run`)
+  # ---------------------------------------------------------------------------
+  # Pruebas:        docker compose run --rm --build tests [--rapido] [--reset-estado]
+  # Experimentos:   docker compose run --rm --build experimentos [--reps 3] [--rapido]
+  tests:
+    profiles: ["tests"]
+    build:
+      context: .
+      dockerfile: runner/Dockerfile
+    working_dir: /repo
+    entrypoint: ["python", "scripts/ejecutar_tests.py"]
+    environment:
+      COMPOSE_ARGS: "-f docker-compose.yml"      # sin el override que publica puertos en el host
+      MATRICULAS_API_KEYS: ${MATRICULAS_API_KEYS:-dev-matriculas-key-123}
+      RESET_ESTADO: ${RESET_ESTADO:-1}           # al terminar borra contenedores y volúmenes
+    volumes:
+      - .:/repo
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      matriculas-api:
+        condition: service_started
+
+  experimentos:
+    profiles: ["experimentos"]
+    build:
+      context: .
+      dockerfile: runner/Dockerfile
+    working_dir: /repo
+    entrypoint: ["python", "experiment/ejecutar_todo.py"]
+    environment:
+      COMPOSE_ARGS: ""
+      API_KEY: ${MATRICULAS_API_KEYS:-dev-matriculas-key-123}
+    volumes:
+      - .:/repo
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      matriculas-api:
+        condition: service_started
 
 volumes:
   cupos_data:

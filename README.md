@@ -25,7 +25,7 @@ defecto.
 ├── proto/
 │   └── cupos.proto          # contrato gRPC de Cupos, paquete cupo.v1 (fuente de verdad de la integración)
 ├── docs/adr/                # ADR D1–D4 + D5 (autenticación)
-├── experiment/              # experimentos, datos crudos (data/raw) y figuras
+├── experiment/              # scripts, datos crudos (data/raw) y figuras de los experimentos
 ├── tests/                   # grpc/, integration/ y contract/
 ├── cupos/                   # servicio Cupos (Python + gRPC + SQLite) - sin cambios
 │   ├── Dockerfile
@@ -122,6 +122,62 @@ Para ejecutarlo solo:
 docker compose up --build cupos
 ```
 
+## Ejecución automática de pruebas y experimentos
+
+Dos contenedores ejecutan todo sin intervención. No se levantan con `docker compose up`: solo
+con `run`, y se detienen solos al terminar.
+
+### Pruebas
+
+```bash
+docker compose run --rm --build tests                 # suite completa (48 pruebas)
+docker compose run --rm tests --rapido                # sin las pruebas que apagan contenedores
+docker compose run --rm tests -k idempotency          # cualquier otro argumento va a pytest
+```
+
+El contenedor levanta lo que falte, espera a la API, ejecuta pytest, **borra los cachés de la
+corrida** (`__pycache__`, `.pytest_cache`, `tests/.generated`) y, por defecto, **restablece el
+estado**: elimina los contenedores y los volúmenes de datos de Cupos y Matrículas, para que la
+próxima corrida parta de cero y no herede cupos retenidos de pruebas anteriores. Para conservar
+el sistema levantado: `RESET_ESTADO=0 docker compose run --rm tests`. Termina con el código de
+salida de pytest (0 = todo bien).
+
+### Experimentos
+
+```bash
+docker compose run --rm --build experimentos          # 3 repeticiones (20 a 30 minutos)
+docker compose run --rm experimentos --rapido         # prueba de humo (pocos minutos)
+docker compose run --rm experimentos --reps 5
+docker compose run --rm experimentos --solo-graficar  # regenera figuras con los últimos CSV
+```
+
+Ejecuta el experimento 1 (timeout y circuit breaker) y el 2 (consistencia de cupos), genera las
+figuras y deja el sistema en su configuración normal. Los resultados quedan en tu carpeta:
+datos crudos en `experiment/data/raw/`, figuras en `experiment/results/` y las tablas resumen
+(para el Cuadro 1 del informe) en `experiment/results/resumen_<fecha>.txt`.
+
+### Sin contenedor
+
+Los mismos ejecutores sirven directamente en tu máquina, con el sistema ya levantado:
+
+```bash
+python scripts/ejecutar_tests.py [--rapido] [--reset-estado]
+python experiment/ejecutar_todo.py [--rapido] [--reps 3]
+```
+
+### Requisitos y notas
+
+- Los contenedores usan el socket de Docker del anfitrión (`/var/run/docker.sock`) porque las
+  pruebas de falla y los experimentos apagan y reinician contenedores. En Docker Desktop
+  (Windows/macOS) funciona sin configuración adicional.
+- El proyecto de compose tiene un nombre fijo (`name: integracion-sistemas-t1`) para que los
+  contenedores ejecutores controlen exactamente los mismos servicios. Si ya tenías el sistema
+  levantado con el nombre anterior, ejecuta antes `docker compose down` **con la versión
+  anterior del compose** (o `docker rm -f` de los contenedores antiguos) para liberar el
+  puerto 8000.
+- El repositorio se monta en `/repo`: los cambios en el código se ven sin reconstruir la
+  imagen, y los resultados quedan directamente en tu carpeta.
+
 ## Tests
 
 La suite valida el contrato gRPC de Cupos, los endpoints REST de Matrículas, la
@@ -149,14 +205,6 @@ python -m pytest tests -q                    # todas (48)
 
 Por categoría: `tests/grpc`, `tests/integration`, `tests/contract`, o por
 marcador (`-m grpc`).
-
-## Experimentos
-
-La metodología, las hipótesis, las variables, las instrucciones de ejecución
-y la descripción de todas las figuras se encuentran en
-[`experiment/README.md`](experiment/README.md). Allí se documentan los
-experimentos de timeout y circuit breaker, consistencia de cupos y throughput
-bajo carga.
 
 ## Historial de versiones del contrato
 
