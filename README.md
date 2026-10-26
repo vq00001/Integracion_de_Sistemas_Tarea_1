@@ -25,7 +25,7 @@ defecto.
 ├── proto/
 │   └── cupos.proto          # contrato gRPC de Cupos, paquete cupo.v1 (fuente de verdad de la integración)
 ├── docs/adr/                # ADR D1–D4 + D5 (autenticación)
-├── experiment/              # scripts, datos crudos (data/raw) y figuras de los experimentos
+├── experiment/              # experimentos, datos crudos (data/raw) y figuras
 ├── tests/                   # grpc/, integration/ y contract/
 ├── cupos/                   # servicio Cupos (Python + gRPC + SQLite) - sin cambios
 │   ├── Dockerfile
@@ -150,6 +150,14 @@ python -m pytest tests -q                    # todas (48)
 Por categoría: `tests/grpc`, `tests/integration`, `tests/contract`, o por
 marcador (`-m grpc`).
 
+## Experimentos
+
+La metodología, las hipótesis, las variables, las instrucciones de ejecución
+y la descripción de todas las figuras se encuentran en
+[`experiment/README.md`](experiment/README.md). Allí se documentan los
+experimentos de timeout y circuit breaker, consistencia de cupos y throughput
+bajo carga.
+
 ## Historial de versiones del contrato
 
 | Fecha | Contrato | Cambio | Clasificación |
@@ -157,17 +165,3 @@ marcador (`-m grpc`).
 | 2026-09-25 | REST `/v1`, gRPC `cupo` | Versión inicial | — |
 | 2026-10-21 | gRPC `cupo` → **`cupo.v1`** | Se versiona el `package` | Cambio de nombre del servicio; ambos extremos se regeneran juntos (aún sin consumidores externos) |
 | 2026-10-21 | REST `/v1` | Cabecera opcional `Idempotency-Key`; estado `PENDIENTE`; respuestas `502`/`504`; clave inválida `403`→`401`; RUT validado | Ver tabla en `docs/adr/D3-...` |
-
-## Declaración de uso de asistentes de IA
-
-> **Completar antes de entregar.** El encargo exige declarar qué se usó, para qué y qué se
-> verificó, y que cada integrante pueda explicar cualquier línea de código en la defensa.
-
-- **Herramienta:** Claude (Anthropic).
-- **Para qué se usó:** apoyo en la dockerización, implementación de la suite de pruebas y en los scripts del experimento. 
-  Además, tras la evaluación, en el diseño e implementación de las correcciones de consistencia
-  (matrícula en dos pasos, idempotencia, conciliador) y de seguridad (401, validación de
-  RUT, puertos, secretos).
-- **Qué se verificó:** el código modificado se ejecutó contra Cupos y la API reales, con la
-  suite completa (48 pruebas) sobre SQLite y PostgreSQL, incluyendo la migración de una
-  base existente. Los datos del informe provienen de las corridas del propio grupo.
