@@ -213,3 +213,9 @@ marcador (`-m grpc`).
 | 2026-09-25 | REST `/v1`, gRPC `cupo` | Versión inicial | — |
 | 2026-10-21 | gRPC `cupo` → **`cupo.v1`** | Se versiona el `package` | Cambio de nombre del servicio; ambos extremos se regeneran juntos (aún sin consumidores externos) |
 | 2026-10-21 | REST `/v1` | Cabecera opcional `Idempotency-Key`; estado `PENDIENTE`; respuestas `502`/`504`; clave inválida `403`→`401`; RUT validado | Ver tabla en `docs/adr/D3-...` |
+
+## Declaración de uso de Inteligencia Artificial
+
+En el desarrollo de este trabajo, se utilizó inteligencia artificial como herramienta de apoyo para la revisión y corrección de aspectos sintácticos del código, la identificación y comparación de alternativas de implementación, la generalización de secciones repetitivas y la documentación del código.
+
+Asimismo, durante la elaboración del informe, se empleó para mejorar la redacción de los textos y adaptar el contenido al formato LaTeX, facilitando la preparación y compilación del documento. En todos los casos, su uso tuvo como objetivo apoyar el proceso de desarrollo y documentación del trabajo.
