@@ -54,7 +54,11 @@ def test_el_contrato_declara_autenticacion_y_idempotencia(spec):
     params = spec["paths"]["/v1/enrollments"]["post"]["parameters"]
     assert any(p["name"] == "Idempotency-Key" and p["in"] == "header" for p in params)
     assert "504" in spec["paths"]["/v1/enrollments"]["post"]["responses"]
-    assert "403" not in spec["paths"]["/v1/enrollments"]["post"]["responses"]
+    # Hay permisos por estudiante: 403 (autenticado, pero no puede operar sobre ese recurso).
+    assert "403" in spec["paths"]["/v1/enrollments"]["post"]["responses"]
+    assert "403" in spec["paths"]["/v1/students"]["post"]["responses"]
+    for ruta in ("/v1/students/{student_id}/api-key",):
+        assert {"post", "get", "delete"} <= spec["paths"][ruta].keys()
 
 
 def test_respuestas_de_estudiantes_cumplen_el_contrato(api, api_sin_auth, spec, estudiante):
@@ -77,3 +81,18 @@ def test_respuestas_de_matriculas_cumplen_el_contrato(api, spec, estudiante):
     validar(spec, "get", "/v1/enrollments", api.get("/v1/enrollments"))
     validar(spec, "post", "/v1/enrollments/{enrollment_id}/revert", api.post(f"/v1/enrollments/{eid}/revert"))
     validar(spec, "post", "/v1/enrollments/{enrollment_id}/revert", api.post(f"/v1/enrollments/{eid}/revert"))  # 409
+
+
+def test_respuestas_de_api_keys_y_permisos_cumplen_el_contrato(api, spec, estudiante):
+    from tests.conftest import Api, BASE_URL
+    ruta = "/v1/students/{student_id}/api-key"
+    emitida = api.post(f"/v1/students/{estudiante['id']}/api-key")
+    validar(spec, "post", ruta, emitida)                                            # 201
+    validar(spec, "post", ruta, api.post(f"/v1/students/{estudiante['id']}/api-key"))  # 409
+    validar(spec, "get", ruta, api.get(f"/v1/students/{estudiante['id']}/api-key"))   # 200
+    cli = Api(BASE_URL, emitida.json()["api_key"])
+    validar(spec, "get", "/v1/students", cli.get("/v1/students"))                    # 403
+    validar(spec, "post", "/v1/enrollments",
+            cli.post("/v1/enrollments", json={"student_id": "otro", "curso_id": CURSO_CON_CUPO}))  # 403
+    validar(spec, "delete", ruta, api.delete(f"/v1/students/{estudiante['id']}/api-key"))  # 204
+    validar(spec, "delete", ruta, api.delete(f"/v1/students/{estudiante['id']}/api-key"))  # 404

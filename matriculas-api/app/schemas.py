@@ -46,6 +46,24 @@ class StudentPage(BaseModel):
     items: list[StudentOut]
 
 
+class ApiKeyInfo(BaseModel):
+    """Metadatos de la API key activa de un estudiante (nunca incluye el secreto)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    student_id: str
+    key_prefix: str = Field(..., examples=["mat_Ab3k"])
+    created_at: datetime
+
+
+class ApiKeyIssued(ApiKeyInfo):
+    api_key: str = Field(
+        ...,
+        description="Valor completo de la clave. Se muestra UNA sola vez: no se puede recuperar.",
+        examples=["mat_Ab3kD9..."],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Matrículas
 # ---------------------------------------------------------------------------

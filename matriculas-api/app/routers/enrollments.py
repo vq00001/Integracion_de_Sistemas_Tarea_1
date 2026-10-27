@@ -46,7 +46,7 @@ from ..errors import (
     SinCuposError,
 )
 from ..grpc_client import cupos_client
-from ..security import require_api_key
+from ..security import Principal, exigir_acceso_a_estudiante, require_api_key
 
 log = logging.getLogger("matriculas.enrollments")
 
@@ -66,9 +66,11 @@ def _estudiante_o_404(db: Session, student_id: str) -> models.Student:
     return estudiante
 
 
-def _matricula_o_404(db: Session, enrollment_id: str) -> models.Enrollment:
+def _matricula_o_404(db: Session, enrollment_id: str, principal: Principal) -> models.Enrollment:
+    """Matrícula por id. Para un estudiante, una matrícula AJENA se trata como inexistente
+    (404, no 403): así no se le confirma qué ids de matrícula existen."""
     matricula = db.get(models.Enrollment, enrollment_id)
-    if matricula is None:
+    if matricula is None or (not principal.es_admin and matricula.student_id != principal.student_id):
         raise NotFoundError(f"No existe una matrícula con id {enrollment_id}")
     return matricula
 
@@ -221,6 +223,8 @@ def _resolver_conflicto(db: Session, payload: schemas.EnrollmentCreate, client_k
     ),
     responses={
         401: {"model": schemas.ErrorResponse, "description": "Falta la API key o es inválida"},
+        403: {"model": schemas.ErrorResponse,
+              "description": "Una API key de estudiante solo puede matricular a su propio estudiante"},
         404: {"model": schemas.ErrorResponse, "description": "Estudiante o curso no existen"},
         409: {"model": schemas.ErrorResponse,
               "description": "Ya matriculado, matrícula en proceso o sin cupos"},
@@ -236,11 +240,15 @@ def matricular(
     payload: schemas.EnrollmentCreate,
     response: Response,
     db: Session = Depends(get_db),
+    principal: Principal = Depends(require_api_key),
     idempotency_key: str | None = Header(
         default=None, alias="Idempotency-Key", min_length=1, max_length=128,
         description="Identifica este intento para poder reintentarlo sin duplicar el cupo.",
     ),
 ):
+    # Autorización ANTES de consultar la base: un estudiante no debe poder usar esta
+    # ruta para averiguar si existe otro estudiante.
+    exigir_acceso_a_estudiante(principal, payload.student_id)
     _estudiante_o_404(db, payload.student_id)
 
     # 1) ¿Es el reintento de un intento anterior?
@@ -283,8 +291,12 @@ def matricular(
         504: {"model": schemas.ErrorResponse, "description": "Cupos no respondió a tiempo"},
     },
 )
-def revertir_matricula(enrollment_id: str, db: Session = Depends(get_db)):
-    matricula = _matricula_o_404(db, enrollment_id)
+def revertir_matricula(
+    enrollment_id: str,
+    db: Session = Depends(get_db),
+    principal: Principal = Depends(require_api_key),
+):
+    matricula = _matricula_o_404(db, enrollment_id, principal)
     if matricula.estado == E.ANULADA:
         raise ConflictError("La matrícula ya estaba anulada", code="ALREADY_REVERTED")
     if matricula.estado != E.CONFIRMADA:
@@ -317,24 +329,41 @@ def revertir_matricula(enrollment_id: str, db: Session = Depends(get_db)):
     summary="Consultar una matrícula por id",
     responses={401: {"model": schemas.ErrorResponse}, 404: {"model": schemas.ErrorResponse}},
 )
-def obtener_matricula(enrollment_id: str, db: Session = Depends(get_db)):
-    return _matricula_o_404(db, enrollment_id)
+def obtener_matricula(
+    enrollment_id: str,
+    db: Session = Depends(get_db),
+    principal: Principal = Depends(require_api_key),
+):
+    return _matricula_o_404(db, enrollment_id, principal)
 
 
 @router.get(
     "",
     response_model=schemas.EnrollmentPage,
     summary="Listar matrículas",
-    responses={401: {"model": schemas.ErrorResponse}},
+    description=(
+        "Un administrador ve todas (con filtros opcionales). Con una API key de estudiante "
+        "solo se listan sus propias matrículas."
+    ),
+    responses={
+        401: {"model": schemas.ErrorResponse},
+        403: {"model": schemas.ErrorResponse,
+              "description": "Un estudiante filtró por el student_id de otro"},
+    },
 )
 def listar_matriculas(
     db: Session = Depends(get_db),
+    principal: Principal = Depends(require_api_key),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     student_id: str | None = Query(None),
     curso_id: int | None = Query(None),
     estado: models.EstadoMatricula | None = Query(None),
 ):
+    if not principal.es_admin:
+        if student_id:
+            exigir_acceso_a_estudiante(principal, student_id)  # 403 si pide a otro
+        student_id = principal.student_id  # siempre acotado a sus propias matrículas
     stmt = select(models.Enrollment)
     if student_id:
         stmt = stmt.where(models.Enrollment.student_id == student_id)

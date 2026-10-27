@@ -51,8 +51,8 @@ def test_sin_credenciales_da_401(api_sin_auth):
 
 
 def test_credenciales_invalidas_dan_401(api):
-    """Una API key inválida no autentica: 401 (403 se reservaría para un cliente
-    autenticado sin permiso, y esta API no tiene roles)."""
+    """Una API key inválida no autentica: 401 (403 es para un cliente autenticado
+    pero sin permiso sobre ese recurso: ver test_api_keys.py)."""
     r = api.get("/v1/students", headers={"X-API-Key": "clave-incorrecta"})
     assert r.status_code == 401
     assert r.headers["www-authenticate"] == "ApiKey"

@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Matrículas API",
-    "description": "\nAPI REST del sistema de **Matrículas** del Centro de Formación Técnica AprendeMás.\n\nPermite gestionar estudiantes y sus matrículas. Antes de confirmar una\nmatrícula, valida en tiempo real la disponibilidad de cupos consultando\nal servicio **Cupos** a través de gRPC (contrato: `proto/cupos.proto`).\n\n### Autenticación\nTodos los endpoints de negocio requieren la cabecera `X-API-Key` con una\nAPI key válida (ver sección \"Autenticación\" del README para el porqué de\nesta elección).\n\n### Errores\nTodas las respuestas de error usan el mismo formato JSON:\n\n```json\n{\"error\": {\"code\": \"SIN_CUPOS\", \"message\": \"...\", \"details\": null}}\n```\n\n### Idempotencia\n`POST /v1/enrollments` acepta la cabecera `Idempotency-Key`. Reintentar con la\nmisma clave devuelve la misma matrícula y nunca consume un segundo cupo.\n\n### Disponibilidad de Cupos\nLos endpoints que dependen de Cupos (`POST /v1/enrollments`,\n`POST /v1/enrollments/{id}/revert`) distinguen tres fallas de la dependencia:\n\n* `504 Gateway Timeout`: Cupos no respondió a tiempo. El resultado es\n  **incierto**; la matrícula queda `PENDIENTE` y se concilia (ver más abajo).\n* `503 Service Unavailable`: Cupos caído o circuito abierto (falla rápida).\n  Incluye `Retry-After`.\n* `502 Bad Gateway`: Cupos respondió con un error interno inesperado.\n\nUna matrícula `PENDIENTE` se resuelve reintentando con la misma\n`Idempotency-Key` (dentro de la ventana de reintento) o, si no se reintenta, el\nconciliador la anula y libera el cupo. La lectura de datos ya existentes\n(estudiantes y matrículas) no se ve afectada por una caída de Cupos.\n",
+    "description": "\nAPI REST del sistema de **Matrículas** del Centro de Formación Técnica AprendeMás.\n\nPermite gestionar estudiantes y sus matrículas. Antes de confirmar una\nmatrícula, valida en tiempo real la disponibilidad de cupos consultando\nal servicio **Cupos** a través de gRPC (contrato: `proto/cupos.proto`).\n\n### Autenticación\nTodos los endpoints de negocio requieren la cabecera `X-API-Key`. Hay dos tipos de clave:\n\n* **Administrador** (variable `API_KEYS`): acceso total. Es la única que puede crear y\n  listar estudiantes y emitir o revocar claves de estudiante.\n* **Estudiante** (emitida a demanda con `POST /v1/students/{id}/api-key`): solo permite\n  operar sobre los datos de ese estudiante (su ficha y sus matrículas). Con otra\n  persona responde `403`; las matrículas ajenas responden `404`.\n\nVer la sección \"Autenticación\" del README.\n\n### Errores\nTodas las respuestas de error usan el mismo formato JSON:\n\n```json\n{\"error\": {\"code\": \"SIN_CUPOS\", \"message\": \"...\", \"details\": null}}\n```\n\n### Idempotencia\n`POST /v1/enrollments` acepta la cabecera `Idempotency-Key`. Reintentar con la\nmisma clave devuelve la misma matrícula y nunca consume un segundo cupo.\n\n### Disponibilidad de Cupos\nLos endpoints que dependen de Cupos (`POST /v1/enrollments`,\n`POST /v1/enrollments/{id}/revert`) distinguen tres fallas de la dependencia:\n\n* `504 Gateway Timeout`: Cupos no respondió a tiempo. El resultado es\n  **incierto**; la matrícula queda `PENDIENTE` y se concilia (ver más abajo).\n* `503 Service Unavailable`: Cupos caído o circuito abierto (falla rápida).\n  Incluye `Retry-After`.\n* `502 Bad Gateway`: Cupos respondió con un error interno inesperado.\n\nUna matrícula `PENDIENTE` se resuelve reintentando con la misma\n`Idempotency-Key` (dentro de la ventana de reintento) o, si no se reintenta, el\nconciliador la anula y libera el cupo. La lectura de datos ya existentes\n(estudiantes y matrículas) no se ve afectada por una caída de Cupos.\n",
     "version": "1.0.0"
   },
   "paths": {
@@ -31,7 +31,7 @@
         "tags": [
           "Estudiantes"
         ],
-        "summary": "Crear un estudiante",
+        "summary": "Crear un estudiante (solo administrador)",
         "operationId": "crear_estudiante_v1_students_post",
         "parameters": [
           {
@@ -82,6 +82,16 @@
               }
             }
           },
+          "403": {
+            "description": "Requiere API key de administrador",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "409": {
             "description": "RUT o email ya registrados",
             "content": {
@@ -113,7 +123,7 @@
         "tags": [
           "Estudiantes"
         ],
-        "summary": "Listar estudiantes",
+        "summary": "Listar estudiantes (solo administrador)",
         "operationId": "listar_estudiantes_v1_students_get",
         "parameters": [
           {
@@ -195,6 +205,16 @@
             },
             "description": "Unauthorized"
           },
+          "403": {
+            "description": "Requiere API key de administrador",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -219,6 +239,7 @@
           "Estudiantes"
         ],
         "summary": "Consultar un estudiante por id",
+        "description": "Un administrador puede consultar a cualquiera; un estudiante solo a sí mismo.",
         "operationId": "obtener_estudiante_v1_students__student_id__get",
         "parameters": [
           {
@@ -268,6 +289,16 @@
             },
             "description": "Unauthorized"
           },
+          "403": {
+            "description": "El estudiante intenta ver a otro",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "404": {
             "content": {
               "application/json": {
@@ -277,6 +308,286 @@
               }
             },
             "description": "Not Found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      }
+    },
+    "/v1/students/{student_id}/api-key": {
+      "post": {
+        "tags": [
+          "Estudiantes"
+        ],
+        "summary": "Emitir la API key personal de un estudiante (solo administrador)",
+        "description": "Crea la API key del estudiante. Con ella (cabecera `X-API-Key`) el estudiante puede operar **solo sobre sus propios datos**: consultar su ficha y matricularse, revertir y consultar sus matrículas. El valor completo se devuelve **una única vez**; en la base solo queda su hash. Hay una clave activa por estudiante: para rotarla, primero revócala (`DELETE`) y emite otra.",
+        "operationId": "emitir_api_key_v1_students__student_id__api_key_post",
+        "parameters": [
+          {
+            "name": "student_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Student Id"
+            }
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiKeyIssued"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Requiere API key de administrador",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "El estudiante no existe",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "El estudiante ya tiene una clave activa",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      },
+      "get": {
+        "tags": [
+          "Estudiantes"
+        ],
+        "summary": "Consultar los metadatos de la API key activa de un estudiante",
+        "description": "Nunca devuelve el secreto. Un administrador ve la de cualquiera; un estudiante, la suya.",
+        "operationId": "consultar_api_key_v1_students__student_id__api_key_get",
+        "parameters": [
+          {
+            "name": "student_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Student Id"
+            }
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiKeyInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "El estudiante no existe o no tiene clave activa",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Estudiantes"
+        ],
+        "summary": "Revocar la API key activa de un estudiante (solo administrador)",
+        "operationId": "revocar_api_key_v1_students__student_id__api_key_delete",
+        "parameters": [
+          {
+            "name": "student_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Student Id"
+            }
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Requiere API key de administrador",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "El estudiante no existe o no tiene clave activa",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           },
           "422": {
             "description": "Validation Error",
@@ -373,6 +684,16 @@
               }
             }
           },
+          "403": {
+            "description": "Una API key de estudiante solo puede matricular a su propio estudiante",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Estudiante o curso no existen",
             "content": {
@@ -445,6 +766,7 @@
           "Matrículas"
         ],
         "summary": "Listar matrículas",
+        "description": "Un administrador ve todas (con filtros opcionales). Con una API key de estudiante solo se listan sus propias matrículas.",
         "operationId": "listar_matriculas_v1_enrollments_get",
         "parameters": [
           {
@@ -555,6 +877,16 @@
               }
             },
             "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Un estudiante filtró por el student_id de otro",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           },
           "422": {
             "description": "Validation Error",
@@ -783,6 +1115,70 @@
   },
   "components": {
     "schemas": {
+      "ApiKeyInfo": {
+        "properties": {
+          "student_id": {
+            "type": "string",
+            "title": "Student Id"
+          },
+          "key_prefix": {
+            "type": "string",
+            "title": "Key Prefix",
+            "examples": [
+              "mat_Ab3k"
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "student_id",
+          "key_prefix",
+          "created_at"
+        ],
+        "title": "ApiKeyInfo",
+        "description": "Metadatos de la API key activa de un estudiante (nunca incluye el secreto)."
+      },
+      "ApiKeyIssued": {
+        "properties": {
+          "student_id": {
+            "type": "string",
+            "title": "Student Id"
+          },
+          "key_prefix": {
+            "type": "string",
+            "title": "Key Prefix",
+            "examples": [
+              "mat_Ab3k"
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "api_key": {
+            "type": "string",
+            "title": "Api Key",
+            "description": "Valor completo de la clave. Se muestra UNA sola vez: no se puede recuperar.",
+            "examples": [
+              "mat_Ab3kD9..."
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "student_id",
+          "key_prefix",
+          "created_at",
+          "api_key"
+        ],
+        "title": "ApiKeyIssued"
+      },
       "EnrollmentCreate": {
         "properties": {
           "student_id": {

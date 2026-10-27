@@ -42,6 +42,9 @@ class Student(Base):
     matriculas: Mapped[list["Enrollment"]] = relationship(
         back_populates="estudiante", cascade="all, delete-orphan"
     )
+    api_keys: Mapped[list["ApiKey"]] = relationship(
+        back_populates="estudiante", cascade="all, delete-orphan"
+    )
 
 
 class Enrollment(Base):
@@ -99,3 +102,37 @@ class Enrollment(Base):
     )
 
     estudiante: Mapped["Student"] = relationship(back_populates="matriculas")
+
+
+class ApiKey(Base):
+    """API key personal de un estudiante, emitida a demanda por un administrador.
+
+    Solo se guarda el HASH (SHA-256) de la clave: el valor en claro se muestra una
+    única vez al emitirla y no se puede recuperar. Como la clave es un token
+    aleatorio de 256 bits (no una contraseña elegida por una persona), un hash
+    rápido sin sal es suficiente y permite buscarla por índice en cada request.
+
+    Un índice único parcial garantiza UNA clave activa por estudiante; las
+    revocadas (`revoked_at` no nulo) quedan como historial.
+    """
+
+    __tablename__ = "api_keys"
+    __table_args__ = (
+        Index(
+            "uq_api_key_activa_por_estudiante", "student_id", unique=True,
+            postgresql_where=text("revoked_at IS NULL"),
+            sqlite_where=text("revoked_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    student_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("students.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    key_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    # Primeros caracteres de la clave: sirven para identificarla en logs/listados sin exponerla.
+    key_prefix: Mapped[str] = mapped_column(String(12), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    estudiante: Mapped["Student"] = relationship(back_populates="api_keys")

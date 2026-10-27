@@ -14,22 +14,32 @@ La API de Matrículas es el único punto de entrada público del sistema y manej
 
 ## Decisión
 
-API Key en la cabecera `X-API-Key`, declarada en el contrato (`securitySchemes.ApiKeyAuth`), con una clave por sistema cliente, comparada en tiempo constante. Los códigos son:
+API Key en la cabecera `X-API-Key`, declarada en el contrato (`securitySchemes.ApiKeyAuth`) y comparada en tiempo constante, con **dos tipos de clave**:
 
-- `401 Unauthorized` (con `WWW-Authenticate: ApiKey`) cuando la clave falta **o no autentica** (inexistente o inválida).
-- `403 Forbidden` queda reservado para un cliente autenticado sin permiso para una operación. Hoy no hay roles, así que la API no responde 403. (La primera versión respondía 403 ante una clave inválida, lo que es semánticamente incorrecto: el servidor no sabe quién es el cliente.)
+- **Admin** (`API_KEYS`, entorno): acceso total, para secretaría e integraciones internas. Si se usa el valor predeterminado público del repositorio (`dev-matriculas-key-123`), la API registra un `WARNING` al arrancar y en cada request que la use.
+- **Estudiante** (tabla `api_keys`): emitida a demanda por un admin (`POST /v1/students/{id}/api-key`), **una activa por estudiante**, guardada solo como hash SHA-256 y mostrada una única vez. Solo permite operar sobre los datos de ese estudiante: su ficha y sus matrículas.
+
+Códigos:
+
+- `401 Unauthorized` (con `WWW-Authenticate: ApiKey`) cuando la clave falta **o no autentica** (inexistente, inválida o revocada).
+- `403 Forbidden` cuando el cliente está autenticado pero no tiene permiso: una clave de estudiante que intenta crear/listar estudiantes, ver a otro estudiante o matricular a otro. (La primera versión respondía 403 ante una clave inválida, lo que es semánticamente incorrecto.)
+- `404` para una matrícula ajena identificada por id, para no confirmar a un estudiante qué ids existen.
 
 ## Justificación
 
-El modelo de confianza es máquina a máquina, igual que la relación entre Matrículas y Cupos. Una clave por integración permite auditar y revocar a un cliente sin afectar a los demás. El factor de privacidad (ver "Consideraciones de contexto" del informe) pesó en tres decisiones relacionadas: toda ruta de negocio exige la clave, la clave no se versiona en el repositorio, y los errores de autenticación son uniformes y no revelan información.
+El modelo de confianza sigue siendo máquina a máquina. La primera versión usaba una clave compartida que daba acceso a los datos personales de **todos** los estudiantes (RUT, correo, teléfono) a cualquiera que la tuviera; una clave filtrada exponía todo. Con una clave por estudiante, la filtración de una credencial se limita a los datos de una sola persona (principio de mínimo privilegio, relevante por tratarse de datos personales), se puede revocar sin afectar a nadie más y las matrículas quedan atribuibles a una credencial concreta. Sigue valiendo que toda ruta de negocio exige clave, que la clave no se versiona y que los errores de autenticación son uniformes.
+
+Se guarda el hash y no el valor porque la clave es un token aleatorio de 256 bits: un hash rápido sin sal basta (no hay contraseñas débiles que atacar por diccionario) y permite buscarla por índice en cada request sin comparar contra todas.
 
 ## Costo aceptado
 
-- Sin identidad de usuario final: no se sabe qué persona hizo una matrícula, solo qué sistema.
-- Sin permisos granulares: cualquier clave válida puede ejecutar todas las operaciones, incluida la lectura de datos personales de todos los estudiantes.
-- Las claves viven en una variable de entorno en texto plano; una clave filtrada exige rotarla en todos los clientes que la usan.
+- Sin identidad de usuario final con login: la clave identifica a un estudiante, no a la persona que la usa; si se comparte, se comparte el acceso.
+- Permisos de dos niveles (admin / dueño del estudiante), sin scopes por operación.
+- El admin sigue siendo una clave compartida en una variable de entorno en texto plano; si se filtra, hay que rotarla en todos los clientes. El log de uso del valor predeterminado reduce el riesgo de olvidarla, pero no lo elimina.
+- Cada request con clave de estudiante hace una consulta indexada a la base.
+- La clave de estudiante no se puede recuperar: si se pierde, el admin la revoca y emite otra.
 - Sin TLS en el entorno de desarrollo: la clave viajaría en claro. En producción la API debe publicarse detrás de HTTPS.
 
 ## Consecuencias
 
-Si aparece un portal con usuarios finales, se agrega `Authorization: Bearer <JWT>` junto a `X-API-Key` sin romper a los clientes existentes, y recién ahí tendría sentido introducir roles y el código 403. Para producción, las claves deberían guardarse como hash en una tabla con rotación, y publicarse detrás de TLS.
+Si aparece un portal con usuarios finales, se agrega `Authorization: Bearer <JWT>` junto a `X-API-Key` sin romper a los clientes existentes. Para producción, las claves admin también deberían vivir como hash en una tabla con rotación, y publicarse detrás de TLS.

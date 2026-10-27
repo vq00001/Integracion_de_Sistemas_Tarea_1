@@ -9,6 +9,10 @@ from __future__ import annotations
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Valor de DESARROLLO publicado en el repositorio (.env.example, docker-compose). Cualquiera
+# que lea el repo lo conoce: usarlo fuera de una máquina local equivale a no tener clave.
+DEFAULT_ADMIN_API_KEY = "dev-matriculas-key-123"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -37,18 +41,21 @@ class Settings(BaseSettings):
     reconcile_interval_seconds: float = 10.0
 
     # --- Autenticación: API Key ---
-    # Lista de API keys válidas separadas por coma. En un entorno real
-    # esto viviría en una tabla con hashes + rotación, no en texto plano
-    # por env var; para esta tarea se mantiene simple mostrando el
-    # mecanismo de forma explícita (ver README, sección "Autenticación").
-    api_keys: str = "dev-matriculas-key-123"
+    # Hay dos tipos de credencial (ver security.py y README, sección "Autenticación"):
+    #  - API key ADMIN: la(s) de esta variable (separadas por coma). Acceso total
+    #    (secretaría / integraciones internas). Si se usa el valor por defecto
+    #    `DEFAULT_ADMIN_API_KEY`, se deja un WARNING en el log en cada uso.
+    #  - API key de ESTUDIANTE: se emiten a demanda con
+    #    POST /v1/students/{id}/api-key (solo admin), se guardan hasheadas en la
+    #    base y solo permiten operar sobre los datos de ese estudiante.
+    api_keys: str = DEFAULT_ADMIN_API_KEY
 
     # --- Metadata de la app ---
     app_name: str = "Matrículas API"
     app_version: str = "1.0.0"
 
     @property
-    def valid_api_keys(self) -> set[str]:
+    def admin_api_keys(self) -> set[str]:
         return {k.strip() for k in self.api_keys.split(",") if k.strip()}
 
 

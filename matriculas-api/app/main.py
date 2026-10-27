@@ -8,6 +8,7 @@ from .database import init_db
 from .errors import register_exception_handlers
 from .reconciler import Conciliador
 from .routers import enrollments, health, students
+from .security import advertir_clave_por_defecto
 
 DESCRIPTION = """
 API REST del sistema de **Matrículas** del Centro de Formación Técnica AprendeMás.
@@ -17,9 +18,15 @@ matrícula, valida en tiempo real la disponibilidad de cupos consultando
 al servicio **Cupos** a través de gRPC (contrato: `proto/cupos.proto`).
 
 ### Autenticación
-Todos los endpoints de negocio requieren la cabecera `X-API-Key` con una
-API key válida (ver sección "Autenticación" del README para el porqué de
-esta elección).
+Todos los endpoints de negocio requieren la cabecera `X-API-Key`. Hay dos tipos de clave:
+
+* **Administrador** (variable `API_KEYS`): acceso total. Es la única que puede crear y
+  listar estudiantes y emitir o revocar claves de estudiante.
+* **Estudiante** (emitida a demanda con `POST /v1/students/{id}/api-key`): solo permite
+  operar sobre los datos de ese estudiante (su ficha y sus matrículas). Con otra
+  persona responde `403`; las matrículas ajenas responden `404`.
+
+Ver la sección "Autenticación" del README.
 
 ### Errores
 Todas las respuestas de error usan el mismo formato JSON:
@@ -69,6 +76,7 @@ _conciliador: Conciliador | None = None
 def on_startup() -> None:
     global _conciliador
     init_db()
+    advertir_clave_por_defecto()
     if settings.reconcile_interval_seconds > 0:
         _conciliador = Conciliador(settings.reconcile_interval_seconds)
         _conciliador.start()

@@ -16,7 +16,7 @@ matriculas-api/
     ├── database.py        # engine/session SQLAlchemy
     ├── models.py           # ORM: Student, Enrollment
     ├── schemas.py          # Pydantic: request/response, documentados para OpenAPI
-    ├── security.py         # autenticación por API Key
+    ├── security.py         # API Key: admin (entorno) y por estudiante (tabla api_keys, hasheadas)
     ├── errors.py           # excepciones de dominio + sobre JSON uniforme de error
     ├── circuit_breaker.py  # circuit breaker en memoria hacia Cupos
     ├── grpc_client.py      # cliente gRPC con timeout + circuit breaker
@@ -127,40 +127,63 @@ Códigos usados: `VALIDATION_ERROR`, `UNAUTHORIZED`, `NOT_FOUND`,
 `CUPOS_RESPUESTA_INVALIDA` (502), `PERSISTENCE_ERROR`, `INTERNAL_ERROR`.
 (`FORBIDDEN` ya no se usa: ver `docs/adr/D5-autenticacion-api-key.md`.)
 
-## Autenticación: API Key
+## Autenticación y permisos: API Key
 
-Se eligió **API Key** (header `X-API-Key`) en vez de OAuth2/JWT o Basic
-Auth. Razones (detalladas también en `app/security.py`):
+Se eligió **API Key** (header `X-API-Key`) en vez de OAuth2/JWT o Basic Auth
+(razones en `app/security.py` y `docs/adr/D5-autenticacion-api-key.md`): el modelo
+es máquina-a-máquina, la verificación es barata y las credenciales se emiten y
+revocan por cliente sin un servidor de autorización.
 
-1. **Modelo de confianza correcto**: los consumidores de esta API son
-   sistemas cliente (front-end de secretaría académica, futuras
-   integraciones), no usuarios finales anónimos que necesiten un flujo
-   de login interactivo, sesiones o scopes de usuario — es
-   máquina-a-máquina, igual que la relación entre esta misma API y el
-   gRPC de Cupos.
-2. **Simplicidad y costo**: verificar una API key es una comparación
-   contra un set en memoria; no hay que validar firmas ni consultar un
-   Authorization Server en cada request. Importa porque el endpoint de
-   matrícula ya paga el costo/latencia de una llamada gRPC externa.
-3. **Trazabilidad y revocación por integración**: una key por sistema
-   cliente permite auditar quién hizo qué y cortar acceso a un
-   consumidor problemático sin afectar a los demás — suficiente para el
-   nivel de granularidad que pide el problema.
-4. **Evoluciona sin romper el contrato**: si más adelante se necesita
-   identidad de usuario final real, se puede añadir JWT sobre el mismo
-   mecanismo (`Authorization: Bearer ...` conviviendo con `X-API-Key`)
-   sin cambiar los endpoints existentes.
+Hay **dos tipos de clave**, ambas en `X-API-Key`:
 
-Trade-off reconocido: no hay identidad de usuario final ni scopes
-granulares por operación; para esta tarea (integrar dos sistemas
-internos) no hacían falta.
+| | Admin | Estudiante |
+|---|---|---|
+| Origen | Variable de entorno `API_KEYS` (coma-separada) | Emitida a demanda: `POST /v1/students/{id}/api-key` (solo admin) |
+| Almacenamiento | Entorno (texto plano) | Tabla `api_keys`, **solo el hash SHA-256**; el valor se muestra una única vez |
+| Cantidad | Las que se configuren | **Una activa por estudiante** (índice único parcial) |
+| Alcance | Todo | Solo los datos de ese estudiante |
 
-Implementación: `app/security.py`, dependency de FastAPI
-(`require_api_key`) inyectada en todos los routers de negocio. Las keys
-válidas vienen de la variable `API_KEYS` (coma-separada); en producción
-esto debería vivir en una tabla con hashes y rotación, no en texto plano
-en una env var — se mantiene simple aquí para que el mecanismo sea
-explícito y fácil de revisar.
+**Qué puede hacer cada una**
+
+| Operación | Admin | Estudiante (su clave) |
+|---|---|---|
+| `POST /v1/students`, `GET /v1/students` (listar) | ✅ | ❌ 403 |
+| `GET /v1/students/{id}` | ✅ cualquiera | ✅ solo el suyo (403 si es otro) |
+| `POST /v1/students/{id}/api-key` (emitir), `DELETE` (revocar) | ✅ | ❌ 403 |
+| `GET /v1/students/{id}/api-key` (metadatos, sin secreto) | ✅ | ✅ solo la suya |
+| `POST /v1/enrollments` | ✅ | ✅ solo con su propio `student_id` (403 si es otro) |
+| `GET`/`revert` `/v1/enrollments/{id}` | ✅ | ✅ solo las suyas (una ajena responde **404**) |
+| `GET /v1/enrollments` | ✅ todas | ✅ se acota automáticamente a las suyas |
+
+Códigos: `401` = la clave falta o no autentica (inexistente o revocada);
+`403` = autenticado pero sin permiso sobre ese recurso. Las matrículas ajenas
+responden `404` para no revelar qué ids existen.
+
+**Flujo típico**
+
+```bash
+# 1) secretaría (admin) crea al estudiante y le emite su clave
+curl -X POST localhost:8000/v1/students/<id>/api-key -H "X-API-Key: $ADMIN_KEY"
+#  -> {"api_key": "mat_...", "key_prefix": "mat_Ab3k", ...}   (guardarla: no se vuelve a mostrar)
+
+# 2) el estudiante opera solo sobre lo suyo
+curl -X POST localhost:8000/v1/enrollments -H "X-API-Key: mat_..." \
+     -H "Content-Type: application/json" -d '{"student_id": "<id>", "curso_id": 1}'
+
+# rotar: revocar y emitir otra
+curl -X DELETE localhost:8000/v1/students/<id>/api-key -H "X-API-Key: $ADMIN_KEY"
+```
+
+**Clave admin por defecto.** El repositorio trae `dev-matriculas-key-123` como valor
+de desarrollo; al ser público, equivale a no tener clave fuera de tu máquina. Si
+`API_KEYS` la contiene, la API deja un `WARNING` (`SEGURIDAD: ...`) **al arrancar** y
+**en cada request** autenticado con ella (método, ruta e IP del cliente). Para
+eliminarlo, define `API_KEYS` con un valor propio:
+`python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+
+Implementación: `app/security.py` (`require_api_key` devuelve un `Principal`;
+`require_admin` y `exigir_acceso_a_estudiante` aplican los permisos) y la tabla
+`api_keys` (`app/models.py`, se crea sola con `create_all`: no requiere migración).
 
 ## Manejo de fallas del gRPC de Cupos
 
@@ -229,7 +252,8 @@ La suite `tests/` (ver README raíz) cubre, contra el sistema real:
 - **Privacidad**: Cupos nunca recibe datos personales (solo `curso_id` y una
   clave opaca); el RUT se valida (módulo 11) y se guarda normalizado; los
   errores de validación no devuelven el dato enviado; Postgres y el gRPC de
-  Cupos no se publican en el host. Ver "Consideraciones de contexto" del informe.
+  Cupos no se publican en el host; una clave de estudiante solo accede a los
+  datos de ese estudiante (no puede listar ni leer a otros). Ver "Consideraciones de contexto" del informe.
 - **Esquema existente**: al arrancar sobre una base Postgres de la versión
   anterior, `database.py` migra la tabla `enrollments` (quita la restricción
   única antigua, agrega `client_key` y los índices). Con SQLite local, borra

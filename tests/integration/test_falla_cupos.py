@@ -12,9 +12,6 @@ from tests.conftest import CURSO_CON_CUPO, compose, esperar_api
 pytestmark = pytest.mark.falla
 
 CURSO = CURSO_CON_CUPO
-# Las pruebas de "Cupos lento" miden cuántos cupos quedan retenidos, así que usan un curso
-# propio que ninguna otra prueba toca: así no se mezclan con matrículas de otras pruebas.
-CURSO_LENTO = 2
 
 
 @pytest.fixture
@@ -67,34 +64,39 @@ def test_recuperacion_tras_reiniciar_cupos(api, estudiante):
 # Cupos lento: el timeout deja un resultado INCIERTO que hay que conciliar
 # ---------------------------------------------------------------------------
 
-def _pendientes(api) -> int:
-    r = api.get("/v1/enrollments", params={"estado": "PENDIENTE", "limit": 1})
-    return r.json()["total"]
+def _drenar_pendientes(api, limite_s: float = 45):
+    """Espera a que el conciliador cierre TODAS las matrículas PENDIENTE existentes.
 
-
-def _vaciar_pendientes(api, segundos: float = 30) -> None:
-    """Cierra las matrículas PENDIENTE que dejaron pruebas anteriores (p. ej. las de "Cupos
-    caído"), usando el conciliador con Cupos rápido y un TTL de 1 s.
-
-    Es necesario para que estas pruebas sean deterministas: si quedan pendientes viejas y
-    Cupos está lento, el conciliador las intenta resolver durante la medición y retiene cupos
-    extra. En un equipo lento esas matrículas alcanzaban el TTL justo en ese momento."""
-    compose("up", "-d", "cupos")  # rápido (latencia 0)
-    compose("up", "-d", "--no-deps", "matriculas-api",
-            env={"PENDING_TTL_SECONDS": "1", "RECONCILE_INTERVAL_SECONDS": "1",
-                 "CUPOS_CB_RECOVERY_SECONDS": "1"})
-    time.sleep(3)
-    esperar_api(api)
-    limite = time.monotonic() + segundos
-    while time.monotonic() < limite and _pendientes(api) > 0:
+    Las pruebas con Cupos caído dejan matrículas PENDIENTE huérfanas (nunca llegaron a
+    Cupos). Si siguen ahí cuando Cupos está lento, el conciliador las procesa a mitad de
+    la prueba: `ocuparCupo` se ejecuta en el servidor aunque el cliente ya haya vencido y
+    el `liberarCupo` se pospone, así que el conteo global de cupos libres incluye cupos
+    ajenos y las aserciones de cupos se rompen (p. ej. 28 en vez de 29).
+    """
+    fin = time.monotonic() + limite_s
+    while time.monotonic() < fin:
+        r = api.get("/v1/enrollments", params={"estado": "PENDIENTE", "limit": 1})
+        if r.status_code == 200 and r.json()["total"] == 0:
+            return
         time.sleep(1)
+    pytest.fail("quedaron matrículas PENDIENTE de pruebas anteriores sin conciliar")
 
 
 @pytest.fixture
 def cupos_lento(api):
-    """Cupos tarda 3 s (> timeout de 2 s). La API arranca con TTL largo y conciliador
-    rápido para que la prueba sea corta."""
-    _vaciar_pendientes(api)  # punto de partida limpio, independiente de las pruebas previas
+    """Cupos tarda 3 s (> timeout de 2 s). La API arranca con TTL largo y
+    conciliador rápido para que la prueba sea corta.
+
+    Antes de ralentizar Cupos se drenan las matrículas PENDIENTE que dejaron otras pruebas
+    (con Cupos rápido y TTL de 1 s), para que la prueba parta de un estado conocido."""
+    compose("up", "-d", "cupos")  # rápido (latencia 0)
+    compose("up", "-d", "--no-deps", "matriculas-api",
+            env={"PENDING_TTL_SECONDS": "1", "RECONCILE_INTERVAL_SECONDS": "1",
+                 "CUPOS_CB_RECOVERY_SECONDS": "2"})
+    time.sleep(2)
+    esperar_api(api)
+    _drenar_pendientes(api)
+
     env_api = {"PENDING_TTL_SECONDS": "40", "RECONCILE_INTERVAL_SECONDS": "2",
                "CUPOS_CB_RECOVERY_SECONDS": "2"}
     compose("up", "-d", "cupos", env={"SIMULAR_LATENCIA_MS": "3000"})
@@ -110,7 +112,7 @@ def cupos_lento(api):
 
 def _libres(cupos_stub):
     pb2 = cupos_stub.pb2
-    return cupos_stub.stub.obtenerCupo(pb2.ObtenerRequest(curso_id=CURSO_LENTO)).cupos_libres
+    return cupos_stub.stub.obtenerCupo(pb2.ObtenerRequest(curso_id=CURSO)).cupos_libres
 
 
 def _restaurar_cupos_rapido(api, env_api):
@@ -124,7 +126,7 @@ def test_timeout_da_504_y_el_cupo_huerfano_se_concilia(api, estudiante, cupos_st
     cliente no reintenta, el conciliador la anula y el cupo vuelve a quedar libre."""
     libres_antes = _libres(cupos_stub)
 
-    r = api.post("/v1/enrollments", json={"student_id": estudiante["id"], "curso_id": CURSO_LENTO})
+    r = api.post("/v1/enrollments", json={"student_id": estudiante["id"], "curso_id": CURSO})
     assert r.status_code == 504, r.text
     assert r.json()["error"]["code"] == "CUPOS_TIMEOUT"
     enrollment_id = r.json()["error"]["details"]["enrollment_id"]
@@ -157,7 +159,7 @@ def test_reintentar_tras_timeout_con_la_misma_clave_consume_un_solo_cupo(api, es
     matrícula termina CONFIRMADA con el resultado real."""
     libres_antes = _libres(cupos_stub)
     clave = {"Idempotency-Key": str(uuid.uuid4())}
-    cuerpo = {"student_id": estudiante["id"], "curso_id": CURSO_LENTO}
+    cuerpo = {"student_id": estudiante["id"], "curso_id": CURSO}
 
     r1 = api.post("/v1/enrollments", json=cuerpo, headers=clave)
     assert r1.status_code == 504
