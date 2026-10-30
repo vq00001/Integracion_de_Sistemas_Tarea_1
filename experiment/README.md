@@ -11,23 +11,6 @@ Docker Compose. Por tanto, los resultados dependen del hardware, de la carga
 del equipo y de la configuración utilizada en cada corrida. Los datos crudos
 se conservan en `data/raw/` para que las tablas y figuras puedan regenerarse.
 
-> **Revisión 3: qué cambió en los experimentos y por qué los datos anteriores ya no sirven.**
-> (1) Cada escenario **recrea** Cupos y la API con configuración **explícita**, lee de vuelta la configuración
-> efectiva y la **registra en el CSV**; antes quedaban valores heredados (el circuit breaker con umbral 1000
-> nunca abría, y la figura "CLOSED → OPEN" no mostraba ninguna transición). (2) El control `404` se ejecuta en
-> una **fase propia**, no mezclado con las mediciones. (3) Se **calibra la deriva de reloj** contenedor/anfitrión
-> (las latencias medidas eran ~92-94 % del retraso inyectado). (4) Cupos ahora **verifica el deadline** del
-> cliente antes de confirmar, así que el experimento 2 distingue "Cupos lento antes de procesar" (sin huérfanos)
-> de "operación confirmada y respuesta tardía" (huérfanos). (5) Experimento 2 con la configuración **real** (TTL
-> 30 s, conciliador 10 s) y variando N; experimento 3 con **3 repeticiones**, registro del equipo y media ± σ.
-> (6) Hay una medición nueva para D2 (`tamano_mensaje.py`). Los CSV y figuras anteriores se archivaron en
-> `data/archivo_rev2/` y `results/archivo_rev2/` solo como historia.
->
-> **Estado de los datos:** esta carpeta se entrega **sin resultados de los experimentos 1-3 regenerados**,
-> porque no se pudo ejecutar Docker al preparar la revisión. Los tres scripts se ejecutaron de punta a punta
-> contra un doble de `docker compose` (procesos locales) solo para validar su lógica; esos datos no se incluyen
-> y no representan al sistema en Docker. Hay que correr `docker compose run --rm --build experimentos` y usar
-> esos CSV en el informe. Sí se incluye `data/raw/tamano_mensaje_*.csv` (no depende de Docker).
 
 ## 1. Preparación del entorno
 
