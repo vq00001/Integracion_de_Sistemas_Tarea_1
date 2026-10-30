@@ -8,14 +8,21 @@ quedaba retenido sin ninguna matrícula asociada y nadie lo devolvía.
 Estrategia: una matrícula PENDIENTE más antigua que `pending_ttl_seconds` se
 cierra así, usando la misma clave de idempotencia con la que se intentó:
 
-  1. ocuparCupo(clave): por idempotencia devuelve lo que pasó la primera vez,
-     o, si nunca se procesó, lo procesa ahora. Así se conoce con certeza el
-     estado real sin adivinar.
-  2. Si quedó un cupo retenido (CUPO_OCUPADO) → liberarCupo(clave), que también
-     es idempotente (se libera una sola vez aunque se repita).
-  3. La matrícula pasa a ANULADA con un motivo (queda auditada).
+  1. consultarOperacion(clave): RPC de SOLO LECTURA que dice qué ocurrió con esa clave en
+     Cupos. Antes se hacía ocupar+liberar, que retenía un cupo real unos milisegundos (un
+     estudiante legítimo podía ver SIN_CUPOS justo en ese instante) y volvía a mutar Cupos
+     para averiguar algo que solo había que leer.
+  2. Si la clave ocupó un cupo y no lo liberó → liberarCupo(clave) (idempotente; Cupos solo
+     libera lo que esa clave ocupó).
+  3. Si la clave nunca ocupó nada → no hay nada que devolver. Es seguro porque Cupos no confirma
+     operaciones cuyo deadline ya venció (ver cupos/src/server.py) y el TTL es muy superior al
+     deadline: una llamada de hace > TTL ya no puede completarse.
+  4. La matrícula pasa a ANULADA con un motivo (queda auditada).
 
 Si Cupos sigue caído, no se cambia nada y se reintenta en el siguiente ciclo.
+
+Con varias réplicas de la API corre un conciliador por réplica: en PostgreSQL se toma un candado
+consultivo por ciclo para que solo uno trabaje a la vez.
 
 Se anula en vez de confirmar a propósito: al cliente se le dijo "resultado
 incierto, reintenta"; si nunca reintentó no se le debe matricular en silencio
@@ -26,56 +33,64 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import datetime, timedelta
+from datetime import timedelta
 
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 
 from . import models
 from .config import settings
 from .database import SessionLocal
-from .errors import ApiError, CursoNoEncontradoError, SinCuposError
+from .errors import ApiError
 from .grpc_client import cupos_client
+from .time import utc_now
 
 log = logging.getLogger("matriculas.reconciler")
 
 MOTIVO = "Caducó sin confirmación de Cupos (conciliación automática)"
 
 
+LOCK_CONCILIADOR = 727002  # clave del candado consultivo de PostgreSQL
+
+
 def conciliar_pendientes(db) -> dict:
     """Cierra las matrículas PENDIENTES caducadas. Devuelve un resumen."""
-    corte = datetime.utcnow() - timedelta(seconds=settings.pending_ttl_seconds)
-    caducadas = db.execute(
-        select(models.Enrollment.id, models.Enrollment.curso_id, models.Enrollment.idempotency_key)
-        .where(models.Enrollment.estado == models.EstadoMatricula.PENDIENTE,
-               models.Enrollment.updated_at < corte)
-        .limit(50)
-    ).all()
-
     resumen = {"cerradas": 0, "pendientes": 0}
-    for enrollment_id, curso_id, clave in caducadas:
-        try:
-            try:
-                cupos_client.ocupar_cupo(curso_id, clave)   # estado real, de forma idempotente
-                retenido = True
-            except (SinCuposError, CursoNoEncontradoError):
-                retenido = False                            # Cupos no retuvo nada
-            if retenido:
-                cupos_client.liberar_cupo(curso_id, clave)  # devuelve el cupo (idempotente)
-        except ApiError as exc:
-            log.warning("conciliación de %s pospuesta: %s", enrollment_id, exc.code)
-            resumen["pendientes"] += 1
-            continue
+    es_pg = db.get_bind().dialect.name == "postgresql"
+    if es_pg and not db.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": LOCK_CONCILIADOR}).scalar():
+        return resumen  # otra réplica está conciliando
+    try:
+        corte = utc_now() - timedelta(seconds=settings.pending_ttl_seconds)
+        caducadas = db.execute(
+            select(models.Enrollment.id, models.Enrollment.curso_id, models.Enrollment.idempotency_key)
+            .where(models.Enrollment.estado == models.EstadoMatricula.PENDIENTE,
+                   models.Enrollment.updated_at < corte)
+            .limit(50)
+        ).all()
 
-        db.execute(
-            update(models.Enrollment)
-            .where(models.Enrollment.id == enrollment_id,
-                   models.Enrollment.estado == models.EstadoMatricula.PENDIENTE)
-            .values(estado=models.EstadoMatricula.ANULADA, motivo=MOTIVO, updated_at=datetime.utcnow())
-        )
-        db.commit()
-        resumen["cerradas"] += 1
-        log.info("matrícula %s cerrada por el conciliador (cupo no retenido)", enrollment_id)
-    return resumen
+        for enrollment_id, curso_id, clave in caducadas:
+            try:
+                estado_ocupar, estado_liberar = cupos_client.consultar_operacion(clave)  # solo lectura
+                if estado_ocupar == "CUPO_OCUPADO" and estado_liberar != "CUPO_LIBERADO":
+                    cupos_client.liberar_cupo(curso_id, clave)  # devuelve el cupo (idempotente)
+            except ApiError as exc:
+                log.warning("conciliación de %s pospuesta: %s", enrollment_id, exc.code)
+                resumen["pendientes"] += 1
+                continue
+
+            db.execute(
+                update(models.Enrollment)
+                .where(models.Enrollment.id == enrollment_id,
+                       models.Enrollment.estado == models.EstadoMatricula.PENDIENTE)
+                .values(estado=models.EstadoMatricula.ANULADA, motivo=MOTIVO, updated_at=utc_now())
+            )
+            db.commit()
+            resumen["cerradas"] += 1
+            log.info("matrícula %s cerrada por el conciliador (cupo no retenido)", enrollment_id)
+        return resumen
+    finally:
+        if es_pg:
+            db.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": LOCK_CONCILIADOR})
+            db.commit()
 
 
 class Conciliador(threading.Thread):

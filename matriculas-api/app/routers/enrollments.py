@@ -20,14 +20,20 @@ de dos pasos con la base local y Cupos):
          y libera el cupo (ver reconciler.py).
   3. Si falla el guardado local tras ocupar el cupo, se compensa liberando
      el cupo con la misma clave.
+
+Reversión (POST /v1/enrollments/{id}/revert): libera en Cupos y luego registra ANULADA. Aquí NO se
+compensa "volviendo a ocupar" si el guardado falla, a diferencia de la confirmación: re-ocupar no
+es seguro (otra persona pudo tomar el cupo entre medias y quedaría sobreventa). En cambio se
+avanza: se reintenta el guardado y, si sigue fallando, se responde 500 pidiendo repetir la
+reversión, que es idempotente (liberar con la misma clave devuelve el resultado ya guardado).
 """
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+import time
 
 from fastapi import APIRouter, Depends, Header, Query, Response, status
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -46,7 +52,8 @@ from ..errors import (
     SinCuposError,
 )
 from ..grpc_client import cupos_client
-from ..security import Principal, exigir_acceso_a_estudiante, require_api_key
+from ..time import utc_now
+from ..security import Principal, exigir_acceso_a_estudiante, limitar_escrituras, require_api_key
 
 log = logging.getLogger("matriculas.enrollments")
 
@@ -107,7 +114,7 @@ def _confirmar(db: Session, enrollment_id: str, curso_id: int, clave: str) -> mo
         resultado = db.execute(
             update(models.Enrollment)
             .where(models.Enrollment.id == enrollment_id, models.Enrollment.estado == E.PENDIENTE)
-            .values(estado=E.CONFIRMADA, updated_at=datetime.utcnow())
+            .values(estado=E.CONFIRMADA, updated_at=utc_now())
         )
         db.commit()
     except SQLAlchemyError as exc:
@@ -149,15 +156,23 @@ def _completar(db: Session, matricula: models.Enrollment, *, primer_intento: boo
 
 def _retomar(db: Session, previa: models.Enrollment, payload: schemas.EnrollmentCreate,
              response: Response) -> models.Enrollment:
-    """Reintento con una Idempotency-Key que ya existe."""
-    if previa.student_id != payload.student_id or previa.curso_id != payload.curso_id:
+    """Reintento con una Idempotency-Key que ya existe (siempre del MISMO estudiante)."""
+    if previa.curso_id != payload.curso_id:
         raise IdempotencyKeyReusedError(
-            "Esa Idempotency-Key ya se usó con una solicitud distinta (otro estudiante o curso)."
+            "Esa Idempotency-Key ya se usó con una solicitud distinta (otro curso)."
         )
     response.headers["Idempotent-Replayed"] = "true"
+    if previa.estado == E.ANULADA:
+        # Antes se respondía 201 con estado ANULADA, que parece un éxito. Una matrícula anulada
+        # (revertida o cerrada por el conciliador) no se "repite": hay que iniciar un intento nuevo.
+        raise ConflictError(
+            "Esa matrícula ya fue anulada. Inicia un intento nuevo con otra Idempotency-Key.",
+            code="ENROLLMENT_ANNULLED",
+            details={"enrollment_id": previa.id, "estado": previa.estado.value},
+        )
     if previa.estado != E.PENDIENTE:
-        return previa  # mismo resultado que la primera vez (CONFIRMADA o ya ANULADA)
-    edad = (datetime.utcnow() - previa.updated_at).total_seconds()
+        return previa  # CONFIRMADA: mismo resultado que la primera vez
+    edad = (utc_now() - previa.updated_at).total_seconds()
     if edad > settings.pending_ttl_seconds / 2:
         # Ventana de reintento agotada: de aquí en adelante solo actúa el conciliador.
         raise ConflictError(
@@ -174,7 +189,10 @@ def _resolver_conflicto(db: Session, payload: schemas.EnrollmentCreate, client_k
     """La inserción chocó con un índice único: otro request ganó la carrera."""
     if client_key:
         previa = db.execute(
-            select(models.Enrollment).where(models.Enrollment.client_key == client_key)
+            select(models.Enrollment).where(
+                models.Enrollment.student_id == payload.student_id,
+                models.Enrollment.client_key == client_key,
+            )
         ).scalar_one_or_none()
         if previa is not None:
             return _retomar(db, previa, payload, response)
@@ -215,7 +233,8 @@ def _resolver_conflicto(db: Session, payload: schemas.EnrollmentCreate, client_k
         "**Idempotencia.** Envía una cabecera `Idempotency-Key` (p. ej. un UUID) para poder "
         "reintentar con seguridad: repetir la solicitud con la misma clave devuelve la misma "
         "matrícula (cabecera `Idempotent-Replayed: true`) y nunca consume un segundo cupo. "
-        "Una clave identifica un intento; reutilizarla con otro estudiante o curso da 422.\n\n"
+        "Una clave identifica un intento **de ese estudiante**; reutilizarla con otro curso da 422. "
+        "Repetir la clave de una matrícula ya anulada da 409 `ENROLLMENT_ANNULLED`.\n\n"
         "**Resultado incierto (504).** Si Cupos no responde a tiempo, el cupo pudo haberse "
         "ocupado. La matrícula queda `PENDIENTE`: reintenta con la misma clave o consulta "
         "`GET /v1/enrollments/{id}`. Si no se confirma dentro del TTL, se anula "
@@ -227,9 +246,10 @@ def _resolver_conflicto(db: Session, payload: schemas.EnrollmentCreate, client_k
               "description": "Una API key de estudiante solo puede matricular a su propio estudiante"},
         404: {"model": schemas.ErrorResponse, "description": "Estudiante o curso no existen"},
         409: {"model": schemas.ErrorResponse,
-              "description": "Ya matriculado, matrícula en proceso o sin cupos"},
+              "description": "Ya matriculado, matrícula en proceso, anulada o sin cupos"},
         422: {"model": schemas.ErrorResponse,
-              "description": "Datos inválidos o Idempotency-Key reutilizada con otra solicitud"},
+              "description": "Datos inválidos o Idempotency-Key reutilizada con otro curso"},
+        429: {"model": schemas.ErrorResponse, "description": "Demasiadas operaciones por minuto (clave de estudiante)"},
         502: {"model": schemas.ErrorResponse, "description": "Cupos devolvió un error interno"},
         503: {"model": schemas.ErrorResponse, "description": "Cupos no disponible (caído o circuito abierto)"},
         504: {"model": schemas.ErrorResponse,
@@ -249,12 +269,17 @@ def matricular(
     # Autorización ANTES de consultar la base: un estudiante no debe poder usar esta
     # ruta para averiguar si existe otro estudiante.
     exigir_acceso_a_estudiante(principal, payload.student_id)
+    limitar_escrituras(principal)
     _estudiante_o_404(db, payload.student_id)
 
-    # 1) ¿Es el reintento de un intento anterior?
+    # 1) ¿Es el reintento de un intento anterior? La clave se busca SOLO entre las matrículas
+    #    de este estudiante: no hay forma de averiguar (422) si otro estudiante usó la misma.
     if idempotency_key:
         previa = db.execute(
-            select(models.Enrollment).where(models.Enrollment.client_key == idempotency_key)
+            select(models.Enrollment).where(
+                models.Enrollment.student_id == payload.student_id,
+                models.Enrollment.client_key == idempotency_key,
+            )
         ).scalar_one_or_none()
         if previa is not None:
             return _retomar(db, previa, payload, response)
@@ -286,6 +311,8 @@ def matricular(
         404: {"model": schemas.ErrorResponse},
         409: {"model": schemas.ErrorResponse,
               "description": "La matrícula ya estaba anulada o aún está pendiente"},
+        429: {"model": schemas.ErrorResponse, "description": "Demasiadas operaciones por minuto (clave de estudiante)"},
+        500: {"model": schemas.ErrorResponse, "description": "El cupo se liberó pero no se pudo guardar; repetir"},
         502: {"model": schemas.ErrorResponse},
         503: {"model": schemas.ErrorResponse, "description": "Cupos no disponible"},
         504: {"model": schemas.ErrorResponse, "description": "Cupos no respondió a tiempo"},
@@ -296,6 +323,7 @@ def revertir_matricula(
     db: Session = Depends(get_db),
     principal: Principal = Depends(require_api_key),
 ):
+    limitar_escrituras(principal)
     matricula = _matricula_o_404(db, enrollment_id, principal)
     if matricula.estado == E.ANULADA:
         raise ConflictError("La matrícula ya estaba anulada", code="ALREADY_REVERTED")
@@ -306,18 +334,32 @@ def revertir_matricula(
         )
     curso_id, clave = matricula.curso_id, matricula.idempotency_key
 
-    # Libera con la MISMA clave con la que se ocupó. Es idempotente en Cupos:
-    # si este endpoint se reintenta o se invoca en paralelo, el cupo se libera una sola vez.
+    # Libera con la MISMA clave con la que se ocupó. Cupos solo libera una clave que ocupó y
+    # es idempotente: si este endpoint se reintenta o se invoca en paralelo, el cupo se libera
+    # una sola vez.
     cupos_client.liberar_cupo(curso_id, clave)
 
-    # Transición atómica CONFIRMADA → ANULADA: solo una petición "gana"; las demás
-    # reciben 409 (el cupo ya fue liberado una única vez).
-    resultado = db.execute(
-        update(models.Enrollment)
-        .where(models.Enrollment.id == enrollment_id, models.Enrollment.estado == E.CONFIRMADA)
-        .values(estado=E.ANULADA, updated_at=datetime.utcnow())
-    )
-    db.commit()
+    # Transición atómica CONFIRMADA → ANULADA: solo una petición "gana"; las demás reciben 409.
+    # Si el guardado falla (el cupo YA está liberado) se reintenta hacia adelante; ver docstring.
+    for intento in range(3):
+        try:
+            resultado = db.execute(
+                update(models.Enrollment)
+                .where(models.Enrollment.id == enrollment_id, models.Enrollment.estado == E.CONFIRMADA)
+                .values(estado=E.ANULADA, updated_at=utc_now())
+            )
+            db.commit()
+            break
+        except SQLAlchemyError as exc:
+            db.rollback()
+            log.exception("falló el guardado de la anulación %s (intento %d/3)", enrollment_id, intento + 1)
+            if intento == 2:
+                raise PersistenceError(
+                    "El cupo fue liberado pero no se pudo registrar la anulación. "
+                    "Repite la reversión: es seguro (idempotente).",
+                    details={"enrollment_id": enrollment_id, "cupo_liberado": True},
+                ) from exc
+            time.sleep(0.1 * (intento + 1))
     if resultado.rowcount == 0:
         raise ConflictError("La matrícula ya estaba anulada", code="ALREADY_REVERTED")
     return db.get(models.Enrollment, enrollment_id)
@@ -355,7 +397,7 @@ def listar_matriculas(
     db: Session = Depends(get_db),
     principal: Principal = Depends(require_api_key),
     limit: int = Query(20, ge=1, le=100),
-    offset: int = Query(0, ge=0),
+    offset: int = Query(0, ge=0, le=100_000),
     student_id: str | None = Query(None),
     curso_id: int | None = Query(None),
     estado: models.EstadoMatricula | None = Query(None),
@@ -372,7 +414,8 @@ def listar_matriculas(
     if estado is not None:
         stmt = stmt.where(models.Enrollment.estado == estado)
 
-    total_count = len(db.execute(stmt).all())
+    # COUNT(*) en la base: no se cargan las filas como objetos ORM (antes era O(N) en memoria).
+    total_count = db.execute(select(func.count()).select_from(stmt.order_by(None).subquery())).scalar_one()
     items = (
         db.execute(stmt.order_by(models.Enrollment.created_at.desc()).limit(limit).offset(offset))
         .scalars()

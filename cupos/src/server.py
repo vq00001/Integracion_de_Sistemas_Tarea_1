@@ -1,6 +1,7 @@
 import logging
 import os
 import sqlite3
+import threading
 import time
 from concurrent import futures
 from contextlib import contextmanager
@@ -17,6 +18,15 @@ MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))
 
 # para experimento
 LATENCIA_MS = int(os.getenv("SIMULAR_LATENCIA_MS", "0"))
+# "antes": la latencia ocurre ANTES de procesar (Cupos lento: el deadline vence antes de que
+#         se confirme nada, y como Cupos verifica el deadline, no retiene el cupo).
+# "despues": la latencia ocurre DESPUES de confirmar (la operacion ya se hizo y la respuesta
+#         llega tarde: es el caso de resultado realmente incierto para el cliente).
+LATENCIA_MODO = os.getenv("SIMULAR_LATENCIA_MODO", "antes")
+# Dias que se conservan las operaciones idempotentes YA CERRADAS (0 = no purgar nunca).
+# Las ocupaciones vigentes (cupo retenido y no liberado) no se purgan nunca: son el
+# registro que permite a Cupos proteger su invariante de capacidad.
+RETENCION_DIAS = int(os.getenv("IDEMPOTENCIA_RETENCION_DIAS", "30"))
 
 
 # datos para base de datos
@@ -75,6 +85,69 @@ def transaccion_escritura():
         raise
     finally:
         con.close()
+
+
+def _deadline_vigente(context) -> bool:
+    """False si el cliente ya cancelo o su deadline vencio.
+
+    Cupos no debe CONFIRMAR una operacion de la que el cliente ya se fue: eso dejaba cupos
+    huerfanos (ocupados sin matricula). Se comprueba antes de modificar y otra vez justo antes
+    del COMMIT; si no esta vigente se hace ROLLBACK. Queda una ventana minima (entre la
+    comprobacion y que la respuesta llegue) que Matriculas cubre con el conciliador.
+    """
+    if not context.is_active():
+        return False
+    restante = context.time_remaining()
+    return restante is None or restante > 0
+
+
+def _exigir_vigente(context) -> None:
+    if not _deadline_vigente(context):
+        context.abort(grpc.StatusCode.DEADLINE_EXCEEDED, "El deadline del cliente ya vencio")
+
+
+def _exigir_clave(clave: str, context) -> None:
+    if not clave:
+        context.abort(
+            grpc.StatusCode.INVALID_ARGUMENT,
+            "idempotency_key es obligatoria: sin ella la operacion no seria idempotente",
+        )
+
+
+def purgar_operaciones(retencion_dias: int) -> int:
+    """Borra operaciones idempotentes CERRADAS con mas de `retencion_dias` dias.
+
+    Se purgan: (a) pares ocupar+liberar cuya liberacion es antigua, y (b) rechazos
+    (SIN_CUPOS / CURSO_NO_ENCONTRADO) antiguos. NO se purga una ocupacion vigente.
+    Devuelve cuantas filas se borraron.
+    """
+    if retencion_dias <= 0:
+        return 0
+    corte = f"-{int(retencion_dias)} days"
+    with transaccion_escritura() as con:
+        borradas = con.execute(
+            "DELETE FROM operaciones_idempotentes WHERE clave IN ("
+            "  SELECT clave FROM operaciones_idempotentes "
+            "  WHERE operacion = 'liberar' AND creado_en < datetime('now', ?))",
+            (corte,),
+        ).rowcount
+        borradas += con.execute(
+            "DELETE FROM operaciones_idempotentes "
+            "WHERE operacion = 'ocupar' AND estado != ? AND creado_en < datetime('now', ?)",
+            (cupos_pb2.CUPO_OCUPADO, corte),
+        ).rowcount
+    if borradas:
+        log.info("purga de operaciones idempotentes cerradas: %d filas", borradas)
+    return borradas
+
+
+def _purga_periodica() -> None:
+    while True:
+        time.sleep(3600)
+        try:
+            purgar_operaciones(RETENCION_DIAS)
+        except Exception:  # la purga nunca debe tumbar el servicio
+            log.exception("fallo la purga de operaciones idempotentes")
 
 
 def init_db() -> None:
@@ -182,118 +255,155 @@ class CuposService(cupos_pb2_grpc.CuposServicer):
             ).fetchall()
         return cupos_pb2.ListarCursosResponse(cursos=[a_curso(r) for r in rows])
 
+    def _latencia_despues(self):
+        if LATENCIA_MODO == "despues":
+            self._simular_latencia()
+
     def ocuparCupo(self, request, context):
-        self._simular_latencia()
-
+        if LATENCIA_MODO != "despues":
+            self._simular_latencia()
         clave = request.idempotency_key
+        _exigir_clave(clave, context)
+        _exigir_vigente(context)
+
         with transaccion_escritura() as con:
-            if clave:  # revisar que no sea un request repetido
-                previa = con.execute(
-                    "SELECT estado FROM operaciones_idempotentes "
-                    "WHERE clave = ? AND operacion = 'ocupar' AND curso_id = ?",
-                    (clave, request.curso_id),
-                ).fetchone()
-
-                # si se repite, devuelve el resultado del primero
-                if previa is not None:
-                    log.info(
-                        "ocuparCupo repetido, clave=%s -> resultado cacheado", clave
+            # revisar que no sea un request repetido (la clave identifica UNA operacion)
+            previa = con.execute(
+                "SELECT estado, curso_id FROM operaciones_idempotentes "
+                "WHERE clave = ? AND operacion = 'ocupar'",
+                (clave,),
+            ).fetchone()
+            if previa is not None:
+                if previa["curso_id"] != request.curso_id:
+                    context.abort(
+                        grpc.StatusCode.INVALID_ARGUMENT,
+                        "La idempotency_key ya se uso para ocupar otro curso",
                     )
-                    return cupos_pb2.OcuparResponse(estado=previa["estado"])
-
-            # resta uno a la cantidad de cupos libres, si es que quedan
-            cur = con.execute(
-                "UPDATE cursos SET cupos_libres = cupos_libres - 1 "
-                "WHERE curso_id = ? AND cupos_libres > 0",
-                (request.curso_id,),
-            )
-            if cur.rowcount == 1:
-                estado = cupos_pb2.CUPO_OCUPADO
+                log.info("ocuparCupo repetido, clave=%s -> resultado cacheado", clave)
+                estado = previa["estado"]
             else:
-                # si no puede ocupar el cupo, revisa si existe el curso y si esta completo
-                existe = con.execute(
-                    "SELECT 1 FROM cursos WHERE curso_id = ?", (request.curso_id,)
-                ).fetchone()
-                estado = (
-                    cupos_pb2.SIN_CUPOS if existe else cupos_pb2.CURSO_NO_ENCONTRADO
+                # resta uno a la cantidad de cupos libres, si es que quedan
+                cur = con.execute(
+                    "UPDATE cursos SET cupos_libres = cupos_libres - 1 "
+                    "WHERE curso_id = ? AND cupos_libres > 0",
+                    (request.curso_id,),
                 )
+                if cur.rowcount == 1:
+                    estado = cupos_pb2.CUPO_OCUPADO
+                else:
+                    existe = con.execute(
+                        "SELECT 1 FROM cursos WHERE curso_id = ?", (request.curso_id,)
+                    ).fetchone()
+                    estado = cupos_pb2.SIN_CUPOS if existe else cupos_pb2.CURSO_NO_ENCONTRADO
 
-            # registrar operacion
-            if clave:
                 con.execute(
                     "INSERT INTO operaciones_idempotentes (clave, operacion, curso_id, estado) "
                     "VALUES (?, 'ocupar', ?, ?)",
                     (clave, request.curso_id, estado),
                 )
+                # Ultima comprobacion ANTES del COMMIT: si el cliente ya se fue, se deshace todo.
+                _exigir_vigente(context)
 
-        log.info(
-            "ocupar cupo curso=%s -> %s",
-            request.curso_id,
-            cupos_pb2.Estado.Name(estado),
-        )
+        self._latencia_despues()
+        log.info("ocupar cupo curso=%s -> %s", request.curso_id, cupos_pb2.Estado.Name(estado))
         return cupos_pb2.OcuparResponse(estado=estado)
 
     def liberarCupo(self, request, context):
-        self._simular_latencia()
-
+        if LATENCIA_MODO != "despues":
+            self._simular_latencia()
         clave = request.idempotency_key
+        _exigir_clave(clave, context)
+        _exigir_vigente(context)
+
         with transaccion_escritura() as con:
-            if clave:  # checkear que no sea un mensaje repetido
-                previa = con.execute(
-                    "SELECT estado FROM operaciones_idempotentes "
-                    "WHERE clave = ? AND operacion = 'liberar' AND curso_id = ?",
-                    (clave, request.curso_id),
-                ).fetchone()
-                if previa is not None:
-                    log.info(
-                        "liberarCupo repetido, clave=%s -> resultado cacheado", clave
-                    )
-                    return cupos_pb2.LiberarResponse(estado=previa["estado"])
-
-            cur = con.execute(
-                "UPDATE cursos SET cupos_libres = cupos_libres + 1 "
-                "WHERE curso_id = ? AND cupos_libres < cupos_totales",
-                (request.curso_id,),
-            )
-            if cur.rowcount == 1:
-                estado = cupos_pb2.CUPO_LIBERADO
+            existe = con.execute(
+                "SELECT 1 FROM cursos WHERE curso_id = ?", (request.curso_id,)
+            ).fetchone()
+            if not existe:
+                estado = cupos_pb2.CURSO_NO_ENCONTRADO
             else:
-                existe = con.execute(
-                    "SELECT 1 FROM cursos WHERE curso_id = ?", (request.curso_id,)
+                previa = con.execute(
+                    "SELECT estado, curso_id FROM operaciones_idempotentes "
+                    "WHERE clave = ? AND operacion = 'liberar'",
+                    (clave,),
                 ).fetchone()
-                if not existe:
-                    estado = cupos_pb2.CURSO_NO_ENCONTRADO
+                if previa is not None and previa["curso_id"] == request.curso_id:
+                    log.info("liberarCupo repetido, clave=%s -> resultado cacheado", clave)
+                    estado = previa["estado"]
                 else:
-                    # El curso ya tiene todos sus cupos libres: liberar sería inconsistente.
-                    context.abort(
-                        grpc.StatusCode.FAILED_PRECONDITION,
-                        "El curso ya tiene todos los cupos libres",
+                    # INVARIANTE: solo se libera lo que ESA clave ocupo en ESE curso.
+                    # (Antes bastaba con que cupos_libres < cupos_totales: una clave inventada
+                    # devolvia un cupo que nadie habia ocupado y permitia sobreventa.)
+                    ocupacion = con.execute(
+                        "SELECT estado, curso_id FROM operaciones_idempotentes "
+                        "WHERE clave = ? AND operacion = 'ocupar'",
+                        (clave,),
+                    ).fetchone()
+                    if (
+                        previa is not None  # la clave ya libero OTRO curso
+                        or ocupacion is None
+                        or ocupacion["curso_id"] != request.curso_id
+                        or ocupacion["estado"] != cupos_pb2.CUPO_OCUPADO
+                    ):
+                        context.abort(
+                            grpc.StatusCode.FAILED_PRECONDITION,
+                            "La idempotency_key no corresponde a una ocupacion vigente de ese curso",
+                        )
+                    cur = con.execute(
+                        "UPDATE cursos SET cupos_libres = cupos_libres + 1 "
+                        "WHERE curso_id = ? AND cupos_libres < cupos_totales",
+                        (request.curso_id,),
                     )
+                    if cur.rowcount != 1:  # no deberia ocurrir si el invariante se mantiene
+                        context.abort(
+                            grpc.StatusCode.FAILED_PRECONDITION,
+                            "El curso ya tiene todos los cupos libres",
+                        )
+                    estado = cupos_pb2.CUPO_LIBERADO
+                    con.execute(
+                        "INSERT INTO operaciones_idempotentes (clave, operacion, curso_id, estado) "
+                        "VALUES (?, 'liberar', ?, ?)",
+                        (clave, request.curso_id, estado),
+                    )
+                    _exigir_vigente(context)
 
-            # registrar operacion
-            if clave:
-                con.execute(
-                    "INSERT INTO operaciones_idempotentes (clave, operacion, curso_id, estado) "
-                    "VALUES (?, 'liberar', ?, ?)",
-                    (clave, request.curso_id, estado),
-                )
-
-        log.info(
-            "liberar cupo curso=%s -> %s",
-            request.curso_id,
-            cupos_pb2.Estado.Name(estado),
-        )
+        self._latencia_despues()
+        log.info("liberar cupo curso=%s -> %s", request.curso_id, cupos_pb2.Estado.Name(estado))
         return cupos_pb2.LiberarResponse(estado=estado)
+
+    def consultarOperacion(self, request, context):
+        """Solo lectura: que paso con una clave (no modifica ningun cupo)."""
+        self._simular_latencia()
+        _exigir_clave(request.idempotency_key, context)
+        with conexion() as con:
+            filas = con.execute(
+                "SELECT operacion, estado, curso_id FROM operaciones_idempotentes WHERE clave = ?",
+                (request.idempotency_key,),
+            ).fetchall()
+        por_op = {f["operacion"]: f for f in filas}
+        ocupar, liberar = por_op.get("ocupar"), por_op.get("liberar")
+        return cupos_pb2.ConsultarOperacionResponse(
+            estado_ocupar=ocupar["estado"] if ocupar else cupos_pb2.ESTADO_SIN_DEFINIR,
+            estado_liberar=liberar["estado"] if liberar else cupos_pb2.ESTADO_SIN_DEFINIR,
+            curso_id=(ocupar or liberar)["curso_id"] if (ocupar or liberar) else 0,
+        )
 
 
 def serve() -> None:
     init_db()
+    try:
+        purgar_operaciones(RETENCION_DIAS)
+    except Exception:
+        log.exception("fallo la purga inicial")
+    if RETENCION_DIAS > 0:
+        threading.Thread(target=_purga_periodica, name="purga", daemon=True).start()
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=MAX_WORKERS))
     cupos_pb2_grpc.add_CuposServicer_to_server(CuposService(), server)
     server.add_insecure_port(f"[::]:{PORT}")
     server.start()
     log.info(
-        "Servicio Cupos escuchando en :%s (latencia simulada: %d ms)", PORT, LATENCIA_MS
+        "Servicio Cupos escuchando en :%s (latencia simulada: %d ms, modo=%s)",
+        PORT, LATENCIA_MS, LATENCIA_MODO,
     )
     server.wait_for_termination()
 

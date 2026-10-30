@@ -11,12 +11,31 @@ Docker Compose. Por tanto, los resultados dependen del hardware, de la carga
 del equipo y de la configuración utilizada en cada corrida. Los datos crudos
 se conservan en `data/raw/` para que las tablas y figuras puedan regenerarse.
 
+> **Revisión 3: qué cambió en los experimentos y por qué los datos anteriores ya no sirven.**
+> (1) Cada escenario **recrea** Cupos y la API con configuración **explícita**, lee de vuelta la configuración
+> efectiva y la **registra en el CSV**; antes quedaban valores heredados (el circuit breaker con umbral 1000
+> nunca abría, y la figura "CLOSED → OPEN" no mostraba ninguna transición). (2) El control `404` se ejecuta en
+> una **fase propia**, no mezclado con las mediciones. (3) Se **calibra la deriva de reloj** contenedor/anfitrión
+> (las latencias medidas eran ~92-94 % del retraso inyectado). (4) Cupos ahora **verifica el deadline** del
+> cliente antes de confirmar, así que el experimento 2 distingue "Cupos lento antes de procesar" (sin huérfanos)
+> de "operación confirmada y respuesta tardía" (huérfanos). (5) Experimento 2 con la configuración **real** (TTL
+> 30 s, conciliador 10 s) y variando N; experimento 3 con **3 repeticiones**, registro del equipo y media ± σ.
+> (6) Hay una medición nueva para D2 (`tamano_mensaje.py`). Los CSV y figuras anteriores se archivaron en
+> `data/archivo_rev2/` y `results/archivo_rev2/` solo como historia.
+>
+> **Estado de los datos:** esta carpeta se entrega **sin resultados de los experimentos 1-3 regenerados**,
+> porque no se pudo ejecutar Docker al preparar la revisión. Los tres scripts se ejecutaron de punta a punta
+> contra un doble de `docker compose` (procesos locales) solo para validar su lógica; esos datos no se incluyen
+> y no representan al sistema en Docker. Hay que correr `docker compose run --rm --build experimentos` y usar
+> esos CSV en el informe. Sí se incluye `data/raw/tamano_mensaje_*.csv` (no depende de Docker).
+
 ## 1. Preparación del entorno
 
 Desde la raíz del repositorio, levantar los servicios necesarios:
 
 ```bash
-docker compose up -d --build cupos matriculas-db matriculas-api
+python scripts/generar_env.py        # una vez (crea .env con claves aleatorias)
+docker compose up -d --build         # cupos + matriculas-db + matriculas-api
 ```
 
 Instalar las dependencias de los scripts:
@@ -26,9 +45,9 @@ python -m pip install -r tests/requirements.txt
 ```
 
 La API debe estar disponible en `http://localhost:8000`. Los scripts utilizan
-la configuración de autenticación y de conexión definida por el proyecto; no
-es necesario levantar un proxy adicional para inyectar latencia, porque Cupos
-ofrece el parámetro `SIMULAR_LATENCIA_MS`.
+la clave admin de `API_KEY`/`MATRICULAS_API_KEYS`/`.env` (sin valor por defecto) y no
+necesitan un proxy para inyectar latencia: Cupos ofrece `SIMULAR_LATENCIA_MS` y
+`SIMULAR_LATENCIA_MODO` (`antes` | `despues` de confirmar la operación).
 
 ## 2. Diseño experimental
 
@@ -57,17 +76,21 @@ circuit breaker debería pasar de `CLOSED` a `OPEN` y responder rápidamente con
   (`SIMULAR_LATENCIA_MS`).
 - **Dependientes:** código HTTP, latencia de la solicitud y estado del
   circuito.
-- **Controladas:** timeout gRPC, curso utilizado, hardware y número de
-  solicitudes por escenario.
+- **Controladas (fijadas y verificadas en cada escenario, y escritas en el CSV):**
+  `CUPOS_GRPC_TIMEOUT_SECONDS`, `CUPOS_CB_FAILURE_THRESHOLD` (5),
+  `CUPOS_CB_RECOVERY_SECONDS` (15), TTL y conciliador por defecto; cursos 1 a 5 y
+  número de solicitudes por escenario.
 
 El barrido predeterminado utiliza latencias de `0`, `250`, `1000`, `1500`,
 `1900`, `2050`, `2500` y `4000 ms`, con 25 solicitudes por escenario.
+(fracciones del timeout, de modo que otro `--timeout-s` escala el barrido).
 Los valores de `1900` y `2050 ms` permiten observar el comportamiento
 inmediatamente antes y después del timeout predeterminado de 2 segundos.
-Cada escenario reinicia Matrículas-API para que el circuito comience cerrado.
-Además, se incluye periódicamente el curso `999`, que no existe, como control
-funcional: sus respuestas `404` no deben confundirse con fallas causadas por
-la latencia de Cupos.
+**Cada escenario recrea Cupos y la API** con su configuración, así el circuito
+comienza `CLOSED`. El control funcional (curso `999`, que no existe; respuestas `404`)
+se ejecuta **una vez por repetición en su propia fase** (`fase = control_404`, Cupos sin latencia), no
+intercalado con las mediciones (`fase = medicion`). Además, antes de medir se calibra la deriva de
+reloj contenedor/anfitrión (`data/raw/reloj_<fecha>.csv`).
 
 Ejecutar tres repeticiones del barrido:
 
@@ -75,12 +98,10 @@ Ejecutar tres repeticiones del barrido:
 python experiment/scripts/timeout.py --label timeout2s --reps 3
 ```
 
-Para estudiar otro timeout, modificar `CUPOS_GRPC_TIMEOUT_SECONDS` en `.env`,
-reconstruir Matrículas-API y utilizar una etiqueta diferente:
+Para estudiar otro timeout ya no hay que tocar `.env`: el script lo recibe y lo aplica a cada escenario:
 
 ```bash
-docker compose up -d --build matriculas-api
-python experiment/scripts/timeout.py --label timeout5s --reps 3
+python experiment/scripts/timeout.py --label timeout5s --timeout-s 5 --reps 3
 ```
 
 ### 2.2. Consistencia de cupos después de un timeout
@@ -90,33 +111,33 @@ python experiment/scripts/timeout.py --label timeout5s --reps 3
 **Pregunta:** ¿qué ocurre con el cupo reservado por Cupos cuando Matrículas-API
 deja de esperar y la matrícula no alcanza a confirmarse?
 
-**Hipótesis:** una operación que supera el timeout puede continuar ejecutándose
-en Cupos y dejar un cupo ocupado sin una matrícula confirmada. Sin
-conciliación, esa ocupación huérfana debería persistir. Con el conciliador,
-las matrículas `PENDIENTE` deberían caducar y liberar el cupo, de modo que la
-cantidad de huérfanos vuelva a cero después del TTL y del intervalo de
-conciliación.
+**Hipótesis** (la tercera es nueva):
+- **H1.** Si Cupos confirma la operación y la *respuesta* llega tarde (`SIMULAR_LATENCIA_MODO=despues`), cada
+  timeout deja un cupo huérfano.
+- **H2.** Sin conciliador esos huérfanos persisten; con conciliador vuelven a cero en ≈ TTL + intervalo.
+- **H3.** Si Cupos es lento *antes* de procesar (`antes`), como ahora verifica el deadline del cliente y hace
+  `ROLLBACK`, los huérfanos son 0 aunque haya N timeouts; solo quedan matrículas `PENDIENTE` (sin cupo retenido)
+  hasta que el conciliador las cierre.
 
 **Variables y controles:**
 
-- **Independiente:** conciliador apagado
-  (`RECONCILE_INTERVAL_SECONDS=0`) o encendido (1 segundo).
-- **Dependientes:** cupos huérfanos inmediatamente después del timeout,
-  matrículas `PENDIENTE`, cupos huérfanos finales y segundos hasta resolver.
-- **Controladas:** latencia de Cupos de 3000 ms, timeout de 2000 ms, curso 4,
-  ocho solicitudes, concurrencia de cuatro, TTL de 6 segundos y umbral del
-  circuito suficientemente alto para que las solicitudes lleguen a Cupos.
-
-El script ejecuta ambos modos en cada repetición y guarda una fila por modo:
+- **Independiente:** estrategia — `sin_conciliador` (latencia `despues`), `con_conciliador` (latencia `despues`,
+  conciliador cada 10 s) y `deadline_en_origen` (latencia `antes`, sin conciliador) — y N (`--niveles-n`, p. ej. `4,8,12`).
+- **Dependientes:** cupos huérfanos inmediatamente después del timeout, matrículas `PENDIENTE`, huérfanos y
+  pendientes finales, y segundos hasta resolver.
+- **Controladas:** latencia de Cupos de 3000 ms, timeout de 2000 ms, curso 4 (15 cupos), concurrencia de cuatro,
+  **TTL real de 30 s y conciliador cada 10 s** (antes TTL 6 s / 1 s; con `--rapido` vuelven a esos valores y
+  queda anotado en el CSV), y umbral del circuito en 1000 **solo** para que cada solicitud llegue a Cupos (queda
+  registrado en `cb_threshold`). Cada corrida parte de un estado limpio (`limpiar`): espera a que el conciliador
+  cierre lo que dejó la corrida anterior, porque Cupos ya no permite "devolver" cupos con claves inventadas.
 
 ```bash
-python experiment/scripts/consistencia.py --label consistencia --reps 3
+python experiment/scripts/consistencia.py --label consistencia --reps 3 --niveles-n 4,8,12
 ```
 
-La métrica de cupos huérfanos se calcula como la diferencia entre las
-ocupaciones observadas en Cupos y las nuevas matrículas `CONFIRMADA`. Esta
-medición permite distinguir la respuesta que recibe el cliente de la
-consistencia efectiva entre ambos servicios.
+La métrica de cupos huérfanos se calcula como la diferencia entre las ocupaciones observadas en Cupos y las
+nuevas matrículas `CONFIRMADA` (medición de caja blanca). Resultados idénticos entre repeticiones son esperables:
+el mecanismo es determinista; la variación útil está entre estrategias y entre valores de N.
 
 ### 2.3. Throughput bajo carga
 
@@ -133,24 +154,24 @@ SQLite— el throughput debería dejar de crecer y el p95 debería aumentar.
 **Variables y controles:**
 
 - **Independiente:** concurrencia, con niveles de `1`, `5`, `10`, `20` y `40`.
-- **Dependientes:** solicitudes por segundo (`rps`), latencia p50, latencia
-  p95 y tasa de éxito.
-- **Controladas:** endpoint, hardware, 60 solicitudes por nivel y cursos
-  distribuidos entre los cursos 1 a 4.
+- **Dependientes:** **ciclos por segundo** y llamadas HTTP por segundo, latencia p50 y p95 y tasa de éxito.
+- **Controladas:** endpoint, configuración por defecto verificada (contenedores recreados al inicio de cada
+  repetición), 100 ciclos por nivel tras un calentamiento descartado, cursos 1 a 4. El equipo (SO, CPUs) se
+  registra en el CSV.
 
-Cada solicitud crea un estudiante, realiza una matrícula y revierte la
-operación inmediatamente cuando tiene éxito. Así se evita agotar los cupos o
-dejar datos de prueba activos:
+**Qué es una "solicitud".** Cada iteración es un **ciclo de 3 llamadas HTTP**: crear estudiante → matricular →
+revertir (se revierte para no agotar cupos). `ciclos_por_s` cuenta ciclos y `llamadas_http_por_s` = 3 × ciclos
+(antes se llamaba `rps`, lo que sugería una sola solicitud por iteración). La latencia p50/p95 es **solo** la de
+`POST /v1/enrollments`, la operación que cruza a Cupos por gRPC.
 
 ```bash
-python experiment/scripts/throughput.py
+python experiment/scripts/throughput.py --reps 3 --n 100
 ```
 
-El resultado se guarda como CSV en `data/raw/`. El nivel de saturación se
-identifica cuando el `rps` deja de aumentar o cuando el p95 presenta un
-incremento pronunciado. Este script no genera una figura automáticamente; sus
-mediciones pueden graficarse a partir del CSV si se requiere incorporarlas al
-informe.
+Se ejecutan **3 repeticiones** y se reporta media ± desviación. **Limitación declarada:** el generador de carga
+corre en el mismo equipo (y, con `docker compose run`, en el mismo host Docker) que la API, Cupos y Postgres, y
+compiten por CPU; las cifras absolutas son de ese equipo. El nivel de saturación se identifica cuando los
+ciclos/s dejan de crecer o el p95 sube de forma pronunciada. `graficar_experimentos.py` genera `throughput.png`.
 
 ## 3. Datos y repetibilidad
 
@@ -161,15 +182,17 @@ efecto de variaciones accidentales del entorno:
 ```bash
 python experiment/scripts/timeout.py --label timeout2s --reps 3
 python experiment/scripts/consistencia.py --label consistencia --reps 3
+python experiment/scripts/throughput.py --reps 3
+python experiment/scripts/tamano_mensaje.py          # D2: protobuf vs JSON (no requiere Docker)
 ```
 
-El graficador acepta el CSV del timeout y, opcionalmente, el CSV de
-consistencia:
+El graficador reconoce cada CSV por sus columnas y también escribe las **tablas** (`results/exp*.csv|md`):
 
 ```bash
 python experiment/graficar_experimentos.py \
   experiment/data/raw/timeout2s_<fecha>.csv \
-  experiment/data/raw/consistencia_<fecha>.csv
+  experiment/data/raw/consistencia_<fecha>.csv \
+  experiment/data/raw/throughput_<fecha>.csv
 ```
 
 Cuando existen varias repeticiones, las figuras muestran promedios por
@@ -179,54 +202,42 @@ la evidencia utilizada para elaborar el informe.
 
 ## 4. Figuras generadas
 
-Todas las figuras se guardan en `results/`. Las siguientes imágenes
-corresponden a los resultados actualmente producidos por
-`graficar_experimentos.py`:
+Todas las figuras y tablas se guardan en `results/` cuando se ejecuta `graficar_experimentos.py` sobre
+datos nuevos. **La carpeta se entrega vacía de resultados vigentes** (ver el aviso del inicio): las imágenes
+de abajo se generarán allí; las anteriores a la revisión 3 están en `results/archivo_rev2/` y no son
+comparables. Qué muestra cada una:
 
 ### Latencia en función del delay
 
-![Latencia del endpoint según el delay de Cupos](results/latencia_vs_delay.png)
-
 **Archivo:** `results/latencia_vs_delay.png`
 
-Compara la latencia media de las respuestas `201` con la latencia introducida
-en Cupos. Las barras de error representan la desviación estándar entre
-repeticiones y la línea vertical marca el timeout configurado de 2000 ms.
-Las respuestas `404` se excluyen porque corresponden al control funcional y no
-a una medición de la dependencia lenta.
+Compara la latencia media de las respuestas `201` con la latencia introducida en Cupos. Las barras de error
+son la desviación estándar entre repeticiones y la línea vertical marca el timeout configurado. El control `404`
+ya no está en estos datos (fase aparte). Si `reloj_*.csv` muestra deriva (factor ≠ 1), la latencia medida
+será ese factor por el retraso inyectado: no es un error del sistema, es del reloj de la VM.
 
 ### Transición del circuit breaker
 
-![Transición del circuit breaker](results/circuit_breaker_transition.png)
-
 **Archivo:** `results/circuit_breaker_transition.png`
 
-Muestra, para el escenario de 2050 ms, la latencia de cada solicitud y la
-transición del circuito desde `CLOSED` hacia `OPEN`. El color representa el
-estado del circuito y la forma identifica el código HTTP: `504`, `503` o
-`404`.
+Muestra, para el primer escenario sobre el timeout, la latencia de cada solicitud y el estado del circuito. El
+**título se arma con lo observado** (antes decía "CLOSED → OPEN" aunque los datos mostraran el circuito siempre
+cerrado). El color es el estado del circuito y la forma, el código HTTP (`504`, `503`, `201`).
 
 ### Distribución de códigos HTTP
 
-![Distribución de códigos HTTP por delay](results/status_por_delay.png)
-
 **Archivo:** `results/status_por_delay.png`
 
-Presenta el número promedio de respuestas de cada código por escenario. Permite
-observar el cambio desde respuestas exitosas hacia `504` por timeout y,
-posteriormente, hacia `503` por circuito abierto, sin perder de vista los
-`404` del control funcional.
+Presenta el número promedio de respuestas de cada código por escenario: de `201` a `504` por timeout y luego a
+`503` por circuito abierto.
 
 ### Consistencia de cupos
 
-![Cupos huérfanos después de un timeout](results/consistencia_cupos.png)
-
 **Archivo:** `results/consistencia_cupos.png`
 
-Compara los cupos huérfanos inmediatamente después del timeout con los
-registrados después de recuperar Cupos y esperar la resolución. La comparación
-entre los modos con y sin conciliador permite evaluar directamente la
-mitigación del estado incierto.
+Compara, por estrategia (`sin_conciliador`, `con_conciliador`, `deadline_en_origen`), los huérfanos justo después
+del timeout, los huérfanos finales y las matrículas pendientes finales. Hay además una figura `throughput.png` y
+tablas `exp1_*`, `exp2_*`, `exp3_*`.
 
 ## 5. Interpretación y límites
 
@@ -237,3 +248,11 @@ del hardware y de la carga concurrente disponible, mientras que los umbrales
 del circuit breaker, el timeout y el TTL determinan la forma de las curvas.
 Por ello, cualquier conclusión del informe debe acompañarse de la
 configuración, el número de repeticiones y los CSV utilizados para generarla.
+
+**Límites concretos de estos experimentos** (para no sobre-interpretar):
+- El timeout (experimento 1) se evalúa con un solo valor por corrida (2 s por defecto; `--timeout-s` para otros): no es un barrido de timeouts.
+- La latencia es **inyectada** (`sleep` en Cupos), no una degradación real (CPU, red, disco): modela un Cupos lento, no todas las formas de lentitud.
+- El experimento 2 mide huérfanos por caja blanca (consulta directa a la base de Cupos): válido para el
+  entorno Compose; no sería observable así en producción.
+- Un reloj de VM con deriva altera las latencias medidas respecto de las inyectadas; se calibra y se registra, no se corrige en los datos.
+- La caché de disponibilidad (`GET /v1/courses`) **no** se midió; el diseño la justifica (D1) pero no hay datos de cuánto reduce la carga.

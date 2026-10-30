@@ -10,7 +10,25 @@ import requests
 
 ROOT = Path(__file__).resolve().parent.parent
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
-API_KEY = os.getenv("API_KEY", os.getenv("MATRICULAS_API_KEYS", "dev-matriculas-key-123").split(",")[0].strip())
+
+
+def _clave_admin() -> str:
+    """Clave admin de las pruebas. NO hay valor por defecto (la API se niega a arrancar sin
+    clave propia): se toma de API_KEY / MATRICULAS_API_KEYS o del .env que genera
+    `python scripts/generar_env.py`."""
+    for nombre in ("API_KEY", "MATRICULAS_API_KEYS"):
+        valor = os.getenv(nombre, "").split(",")[0].strip()
+        if valor:
+            return valor
+    env = ROOT / ".env"
+    if env.exists():
+        for linea in env.read_text(encoding="utf-8").splitlines():
+            if linea.startswith("MATRICULAS_API_KEYS="):
+                return linea.split("=", 1)[1].split(",")[0].strip()
+    pytest.exit("Falta la clave admin: ejecuta `python scripts/generar_env.py` o define API_KEY.", returncode=2)
+
+
+API_KEY = _clave_admin()
 CURSO_CON_CUPO = int(os.getenv("CURSO_CON_CUPO", "1"))
 CURSO_CAPACIDAD_BAJA = int(os.getenv("CURSO_CAPACIDAD_BAJA", "5"))
 CURSO_LLENO = CURSO_CAPACIDAD_BAJA
@@ -111,7 +129,8 @@ def curso_lleno(cupos_stub):
         claves.append(clave)
     yield CURSO_CAPACIDAD_BAJA
     for clave in claves:
-        stub.liberarCupo(pb2.LiberarRequest(curso_id=CURSO_CAPACIDAD_BAJA, idempotency_key=f"teardown-{clave}"))
+        # Cupos solo libera lo que ESA clave ocupó: se libera con la misma clave de la ocupación.
+        stub.liberarCupo(pb2.LiberarRequest(curso_id=CURSO_CAPACIDAD_BAJA, idempotency_key=clave))
 
 
 def compose(*args: str, env: dict | None = None) -> subprocess.CompletedProcess:

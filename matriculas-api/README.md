@@ -17,6 +17,8 @@ matriculas-api/
     ├── models.py           # ORM: Student, Enrollment
     ├── schemas.py          # Pydantic: request/response, documentados para OpenAPI
     ├── security.py         # API Key: admin (entorno) y por estudiante (tabla api_keys, hasheadas)
+    ├── ratelimit.py        # límite de intentos de autenticación fallidos y de escrituras por estudiante
+    ├── cursos_cache.py     # caché en memoria (TTL corto) de la disponibilidad de cursos
     ├── errors.py           # excepciones de dominio + sobre JSON uniforme de error
     ├── circuit_breaker.py  # circuit breaker en memoria hacia Cupos
     ├── grpc_client.py      # cliente gRPC con timeout + circuit breaker
@@ -24,6 +26,7 @@ matriculas-api/
     └── routers/
         ├── students.py
         ├── enrollments.py
+        ├── courses.py       # lectura de cursos y disponibilidad (referencial)
         └── health.py
 ```
 
@@ -48,24 +51,26 @@ fuente de verdad contra la cual validarlo.
 Desde la raíz del repo:
 
 ```bash
-docker compose up --build -d cupos matriculas-db matriculas-api
+python scripts/generar_env.py        # una vez: crea .env con claves aleatorias
+docker compose up --build -d
 ```
 
-(`.env` es opcional: todos los valores tienen un valor por defecto de desarrollo.
-Para personalizarlos, copia la plantilla con `cp .env.example .env`; el archivo
-`.env` real **no se versiona**.)
+(`.env` es **obligatorio**: ya no hay claves por defecto. `scripts/generar_env.py` crea la clave
+admin y la contraseña de Postgres aleatorias; el archivo `.env` real **no se versiona ni debe ir en
+el ZIP de entrega**.)
 
 La API queda en `http://localhost:8000`. Documentación interactiva
 (Swagger UI) en `http://localhost:8000/docs`, esquema OpenAPI crudo en
 `http://localhost:8000/openapi.json`.
 
-Todos los endpoints de negocio requieren la cabecera `X-API-Key`. Con la
-key de desarrollo por defecto:
+Todos los endpoints de negocio requieren la cabecera `X-API-Key`. Con tu clave admin
+(`MATRICULAS_API_KEYS` en `.env`):
 
 ```bash
+ADMIN_KEY=$(grep ^MATRICULAS_API_KEYS= .env | cut -d= -f2)
 curl -X POST http://localhost:8000/v1/students \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: dev-matriculas-key-123" \
+  -H "X-API-Key: $ADMIN_KEY" \
   -d '{"rut":"19011022-3","nombre":"Ana","apellido":"Pérez","email":"ana@example.com"}'
 ```
 
@@ -96,9 +101,12 @@ Todos bajo `/v1`, todos requieren `X-API-Key` salvo `/v1/health`.
 |---|---|---|
 | POST | `/v1/students` | Crear estudiante (valida RUT con dígito verificador) → `201` / `409` / `422` |
 | GET | `/v1/students/{id}` | Consultar estudiante → `200` / `404` |
-| GET | `/v1/students` | Listar (paginado, filtro `rut`) → `200` |
-| POST | `/v1/enrollments` | Matricular (valida cupos vía Cupos; cabecera opcional `Idempotency-Key`) → `201` / `404` / `409` / `422` / `502` / `503` / `504` |
-| POST | `/v1/enrollments/{id}/revert` | Revertir matrícula (libera el cupo) → `200` / `404` / `409` / `502` / `503` / `504` |
+| GET | `/v1/students` | Listar (paginado, `offset` ≤ 100 000, filtro `rut`) → `200` |
+| DELETE | `/v1/students/{id}` | Anonimizar al estudiante (derecho de supresión; solo admin) → `204` / `403` / `404` |
+| GET | `/v1/courses` | Cursos con su disponibilidad, referencial y con caché (`?disponibles=true`) → `200` / `502` / `503` / `504` |
+| GET | `/v1/courses/{curso_id}` | Un curso y su disponibilidad (referencial) → `200` / `404` |
+| POST | `/v1/enrollments` | Matricular (valida cupos vía Cupos; cabecera opcional `Idempotency-Key`) → `201` / `404` / `409` / `422` / `429` / `502` / `503` / `504` |
+| POST | `/v1/enrollments/{id}/revert` | Revertir matrícula (libera el cupo) → `200` / `404` / `409` / `429` / `500` / `502` / `503` / `504` |
 | GET | `/v1/enrollments/{id}` | Consultar matrícula → `200` / `404` |
 | GET | `/v1/enrollments` | Listar (paginado, filtros `student_id`, `curso_id`, `estado`) → `200` |
 | GET | `/v1/health` | Estado del servicio y del circuit breaker hacia Cupos (sin auth) |
@@ -122,7 +130,8 @@ usan el mismo sobre:
 Códigos usados: `VALIDATION_ERROR`, `UNAUTHORIZED`, `NOT_FOUND`,
 `STUDENT_ALREADY_EXISTS`, `ALREADY_ENROLLED`, `ENROLLMENT_IN_PROGRESS`,
 `ENROLLMENT_EXPIRED`, `ENROLLMENT_NOT_CONFIRMED`, `ALREADY_REVERTED`,
-`IDEMPOTENCY_KEY_REUSED`, `SIN_CUPOS`, `CURSO_NO_ENCONTRADO`,
+`IDEMPOTENCY_KEY_REUSED`, `ENROLLMENT_ANNULLED` (409), `STUDENT_ANONYMIZED` (409),
+`TOO_MANY_REQUESTS` (429), `SIN_CUPOS`, `CURSO_NO_ENCONTRADO`,
 `CUPOS_NO_DISPONIBLE` (503), `CUPOS_TIMEOUT` (504),
 `CUPOS_RESPUESTA_INVALIDA` (502), `PERSISTENCE_ERROR`, `INTERNAL_ERROR`.
 (`FORBIDDEN` ya no se usa: ver `docs/adr/D5-autenticacion-api-key.md`.)
@@ -138,9 +147,10 @@ Hay **dos tipos de clave**, ambas en `X-API-Key`:
 
 | | Admin | Estudiante |
 |---|---|---|
-| Origen | Variable de entorno `API_KEYS` (coma-separada) | Emitida a demanda: `POST /v1/students/{id}/api-key` (solo admin) |
+| Origen | Variable de entorno `API_KEYS` (coma-separada), **obligatoria, ≥ 24 caracteres y no pública** | Emitida a demanda: `POST /v1/students/{id}/api-key` (solo admin) |
 | Almacenamiento | Entorno (texto plano) | Tabla `api_keys`, **solo el hash SHA-256**; el valor se muestra una única vez |
 | Cantidad | Las que se configuren | **Una activa por estudiante** (índice único parcial) |
+| Vigencia | Hasta que se rote la variable | `STUDENT_KEY_TTL_DAYS` (90); una vencida da `401` y se revoca sola al emitir otra |
 | Alcance | Todo | Solo los datos de ese estudiante |
 
 **Qué puede hacer cada una**
@@ -174,12 +184,21 @@ curl -X POST localhost:8000/v1/enrollments -H "X-API-Key: mat_..." \
 curl -X DELETE localhost:8000/v1/students/<id>/api-key -H "X-API-Key: $ADMIN_KEY"
 ```
 
-**Clave admin por defecto.** El repositorio trae `dev-matriculas-key-123` como valor
-de desarrollo; al ser público, equivale a no tener clave fuera de tu máquina. Si
-`API_KEYS` la contiene, la API deja un `WARNING` (`SEGURIDAD: ...`) **al arrancar** y
-**en cada request** autenticado con ella (método, ruta e IP del cliente). Para
-eliminarlo, define `API_KEYS` con un valor propio:
+**Sin clave admin por defecto (fail-closed).** La API **no arranca** si `API_KEYS` falta, es un valor
+público conocido (incluido el `dev-matriculas-key-123` que traían versiones anteriores del repositorio) o mide
+menos de 24 caracteres. Genera una con `python scripts/generar_env.py` o
 `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+
+**Formato de la clave de estudiante:** `mat_<id público>.<secreto>`. `key_prefix` es el id público (8 hex
+aleatorios): se puede mostrar en listados y logs sin revelar nada del secreto.
+
+**Abuso:** los intentos de autenticación fallidos se limitan por IP (`AUTH_FAIL_LIMIT` por
+`AUTH_FAIL_WINDOW_SECONDS`) y un estudiante con clave propia tiene un tope de escrituras por minuto
+(`WRITE_RATE_LIMIT_PER_MINUTE`); ambos responden `429` con `Retry-After`. El estado es por proceso (ver D5).
+
+**Sin TLS.** La API habla HTTP: por defecto se publica solo en `127.0.0.1`. Para exponerla hay que poner un
+proxy TLS delante (D5). **Privacidad:** `DELETE /v1/students/{id}` anonimiza los datos personales de un
+estudiante conservando sus matrículas como historial.
 
 Implementación: `app/security.py` (`require_api_key` devuelve un `Principal`;
 `require_admin` y `exigir_acceso_a_estudiante` aplican los permisos) y la tabla
@@ -195,9 +214,10 @@ aquí el resumen operativo (implementado en `grpc_client.py`,
 | Situación | HTTP | Código | ¿Qué pasó con el cupo? |
 |---|---|---|---|
 | Cupos no responde en `CUPOS_GRPC_TIMEOUT_SECONDS` (2 s) | **504** | `CUPOS_TIMEOUT` | **Incierto**: Cupos pudo ocuparlo. La matrícula queda `PENDIENTE`. |
-| Cupos inalcanzable | **503** | `CUPOS_NO_DISPONIBLE` | Incierto (queda `PENDIENTE`). |
+| Cupos inalcanzable: conexión rechazada / sin resolver | **503** | `CUPOS_NO_DISPONIBLE` | Ninguno: la solicitud nunca salió; se borra la intención (no queda `PENDIENTE`). |
+| Cupos inalcanzable: conexión rota a mitad de la llamada | **503** | `CUPOS_NO_DISPONIBLE` | Incierto (queda `PENDIENTE`). |
 | Circuito abierto (fail-fast) | **503** | `CUPOS_NO_DISPONIBLE` | Ninguno: ni se intentó la llamada; no se persiste nada. |
-| Error interno de Cupos | **502** | `CUPOS_RESPUESTA_INVALIDA` | Ninguno. |
+| Error interno de Cupos | **502** | `CUPOS_RESPUESTA_INVALIDA` | Se trata como incierto **por precaución** (queda `PENDIENTE`; ver D4: el ADR anterior decía "ninguno" y el código hacía otra cosa). |
 
 Mecanismos:
 

@@ -58,6 +58,17 @@ class EnrollmentInProgressError(ConflictError):
     code = "ENROLLMENT_IN_PROGRESS"
 
 
+class TooManyRequestsError(ApiError):
+    """Límite de intentos o de escrituras superado → 429 con Retry-After."""
+
+    status_code = 429
+    code = "TOO_MANY_REQUESTS"
+
+    def __init__(self, message: str, *, retry_after: float = 1.0, details: dict | None = None):
+        super().__init__(message, details=details)
+        self.retry_after = max(1, int(retry_after + 0.999))
+
+
 class IdempotencyKeyReusedError(ApiError):
     status_code = 422  # Unprocessable Content
     code = "IDEMPOTENCY_KEY_REUSED"
@@ -109,6 +120,8 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(ApiError)
     async def api_error_handler(request: Request, exc: ApiError):
         headers = {}
+        if isinstance(exc, TooManyRequestsError):
+            headers["Retry-After"] = str(exc.retry_after)
         if isinstance(exc, (DependencyUnavailableError, DependencyTimeoutError)):
             # sugiere al cliente cuándo reintentar en vez de martillar el servicio caído
             headers["Retry-After"] = "5"

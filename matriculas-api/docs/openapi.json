@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Matrículas API",
-    "description": "\nAPI REST del sistema de **Matrículas** del Centro de Formación Técnica AprendeMás.\n\nPermite gestionar estudiantes y sus matrículas. Antes de confirmar una\nmatrícula, valida en tiempo real la disponibilidad de cupos consultando\nal servicio **Cupos** a través de gRPC (contrato: `proto/cupos.proto`).\n\n### Autenticación\nTodos los endpoints de negocio requieren la cabecera `X-API-Key`. Hay dos tipos de clave:\n\n* **Administrador** (variable `API_KEYS`): acceso total. Es la única que puede crear y\n  listar estudiantes y emitir o revocar claves de estudiante.\n* **Estudiante** (emitida a demanda con `POST /v1/students/{id}/api-key`): solo permite\n  operar sobre los datos de ese estudiante (su ficha y sus matrículas). Con otra\n  persona responde `403`; las matrículas ajenas responden `404`.\n\nVer la sección \"Autenticación\" del README.\n\n### Errores\nTodas las respuestas de error usan el mismo formato JSON:\n\n```json\n{\"error\": {\"code\": \"SIN_CUPOS\", \"message\": \"...\", \"details\": null}}\n```\n\n### Idempotencia\n`POST /v1/enrollments` acepta la cabecera `Idempotency-Key`. Reintentar con la\nmisma clave devuelve la misma matrícula y nunca consume un segundo cupo.\n\n### Disponibilidad de Cupos\nLos endpoints que dependen de Cupos (`POST /v1/enrollments`,\n`POST /v1/enrollments/{id}/revert`) distinguen tres fallas de la dependencia:\n\n* `504 Gateway Timeout`: Cupos no respondió a tiempo. El resultado es\n  **incierto**; la matrícula queda `PENDIENTE` y se concilia (ver más abajo).\n* `503 Service Unavailable`: Cupos caído o circuito abierto (falla rápida).\n  Incluye `Retry-After`.\n* `502 Bad Gateway`: Cupos respondió con un error interno inesperado.\n\nUna matrícula `PENDIENTE` se resuelve reintentando con la misma\n`Idempotency-Key` (dentro de la ventana de reintento) o, si no se reintenta, el\nconciliador la anula y libera el cupo. La lectura de datos ya existentes\n(estudiantes y matrículas) no se ve afectada por una caída de Cupos.\n",
-    "version": "1.0.0"
+    "description": "\nAPI REST del sistema de **Matrículas** del Centro de Formación Técnica AprendeMás.\n\nPermite gestionar estudiantes y sus matrículas. Antes de confirmar una\nmatrícula, valida en tiempo real la disponibilidad de cupos consultando\nal servicio **Cupos** a través de gRPC (contrato: `proto/cupos.proto`).\n\n### Autenticación\nTodos los endpoints de negocio requieren la cabecera `X-API-Key`. Hay dos tipos de clave:\n\n* **Administrador** (variable `API_KEYS`): acceso total. Es la única que puede crear y\n  listar estudiantes y emitir o revocar claves de estudiante.\n* **Estudiante** (emitida a demanda con `POST /v1/students/{id}/api-key`): solo permite\n  operar sobre los datos de ese estudiante (su ficha y sus matrículas). Con otra\n  persona responde `403`; las matrículas ajenas responden `404`.\n\nVer la sección \"Autenticación\" del README. Los intentos de autenticación fallidos se limitan\npor IP (`429` + `Retry-After`) y un estudiante con clave propia tiene un tope de escrituras por minuto.\n\n### Cursos y disponibilidad\n`GET /v1/courses` y `GET /v1/courses/{curso_id}` informan los cupos libres (dato **referencial**,\ncon caché de unos segundos). Quien decide si hay cupo es siempre `POST /v1/enrollments`.\n\n### Errores\nTodas las respuestas de error usan el mismo formato JSON:\n\n```json\n{\"error\": {\"code\": \"SIN_CUPOS\", \"message\": \"...\", \"details\": null}}\n```\n\n### Idempotencia\n`POST /v1/enrollments` acepta la cabecera `Idempotency-Key`. Reintentar con la\nmisma clave devuelve la misma matrícula y nunca consume un segundo cupo.\n\n### Disponibilidad de Cupos\nLos endpoints que dependen de Cupos (`POST /v1/enrollments`,\n`POST /v1/enrollments/{id}/revert`) distinguen tres fallas de la dependencia:\n\n* `504 Gateway Timeout`: Cupos no respondió a tiempo. El resultado es\n  **incierto**; la matrícula queda `PENDIENTE` y se concilia (ver más abajo).\n* `503 Service Unavailable`: Cupos caído o circuito abierto (falla rápida). Si la conexión\n  se rechazó (la solicitud nunca salió) no queda nada pendiente y se puede reintentar con\n  una Idempotency-Key nueva o la misma. Incluye `Retry-After`.\n* `502 Bad Gateway`: Cupos respondió con un error interno inesperado. Por precaución la\n  matrícula también queda `PENDIENTE` y se concilia.\n\nUna matrícula `PENDIENTE` se resuelve reintentando con la misma\n`Idempotency-Key` (dentro de la ventana de reintento) o, si no se reintenta, el\nconciliador la anula y libera el cupo. La lectura de datos ya existentes\n(estudiantes y matrículas) no se ve afectada por una caída de Cupos.\n",
+    "version": "1.1.0"
   },
   "paths": {
     "/v1/health": {
@@ -144,6 +144,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 100000,
               "minimum": 0,
               "default": 0,
               "title": "Offset"
@@ -308,6 +309,91 @@
               }
             },
             "description": "Not Found"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Estudiantes"
+        ],
+        "summary": "Anonimizar a un estudiante: derecho de supresión (solo administrador)",
+        "description": "Elimina los datos personales del estudiante (RUT, nombre, apellido, correo, teléfono) reemplazándolos por valores anónimos, revoca su API key y conserva sus matrículas como historial **sin datos personales** (no se borran para no romper el registro de cupos). Es idempotente: repetirla devuelve 204. No se puede deshacer.",
+        "operationId": "anonimizar_estudiante_v1_students__student_id__delete",
+        "parameters": [
+          {
+            "name": "student_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Student Id"
+            }
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Requiere API key de administrador",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "El estudiante no existe",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           },
           "422": {
             "description": "Validation Error",
@@ -607,13 +693,231 @@
         ]
       }
     },
+    "/v1/courses": {
+      "get": {
+        "tags": [
+          "Cursos"
+        ],
+        "summary": "Listar cursos con su disponibilidad (referencial)",
+        "description": "Cursos de Cupos con `cupos_libres`. Con `disponibles=true` solo los que tienen cupos. El dato puede tener hasta `CURSOS_CACHE_TTL_SECONDS` segundos de antigüedad: para reservar, usa `POST /v1/enrollments`.",
+        "operationId": "listar_cursos_v1_courses_get",
+        "parameters": [
+          {
+            "name": "disponibles",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Disponibles"
+            }
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CourseList"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "503": {
+            "description": "Cupos no disponible (caído o circuito abierto)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Cupos no respondió a tiempo",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Cupos devolvió un error interno",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      }
+    },
+    "/v1/courses/{curso_id}": {
+      "get": {
+        "tags": [
+          "Cursos"
+        ],
+        "summary": "Consultar un curso y su disponibilidad (referencial)",
+        "operationId": "obtener_curso_v1_courses__curso_id__get",
+        "parameters": [
+          {
+            "name": "curso_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Curso Id"
+            }
+          },
+          {
+            "name": "X-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CourseOut"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "503": {
+            "description": "Cupos no disponible (caído o circuito abierto)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Cupos no respondió a tiempo",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Cupos devolvió un error interno",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "El curso no existe",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      }
+    },
     "/v1/enrollments": {
       "post": {
         "tags": [
           "Matrículas"
         ],
         "summary": "Matricular a un estudiante en un curso",
-        "description": "Registra la matrícula solo si el curso tiene cupos disponibles según el servicio de Cupos (verificado en tiempo real vía gRPC; consulta y reserva son una sola llamada atómica).\n\n**Idempotencia.** Envía una cabecera `Idempotency-Key` (p. ej. un UUID) para poder reintentar con seguridad: repetir la solicitud con la misma clave devuelve la misma matrícula (cabecera `Idempotent-Replayed: true`) y nunca consume un segundo cupo. Una clave identifica un intento; reutilizarla con otro estudiante o curso da 422.\n\n**Resultado incierto (504).** Si Cupos no responde a tiempo, el cupo pudo haberse ocupado. La matrícula queda `PENDIENTE`: reintenta con la misma clave o consulta `GET /v1/enrollments/{id}`. Si no se confirma dentro del TTL, se anula automáticamente y se libera el cupo.",
+        "description": "Registra la matrícula solo si el curso tiene cupos disponibles según el servicio de Cupos (verificado en tiempo real vía gRPC; consulta y reserva son una sola llamada atómica).\n\n**Idempotencia.** Envía una cabecera `Idempotency-Key` (p. ej. un UUID) para poder reintentar con seguridad: repetir la solicitud con la misma clave devuelve la misma matrícula (cabecera `Idempotent-Replayed: true`) y nunca consume un segundo cupo. Una clave identifica un intento **de ese estudiante**; reutilizarla con otro curso da 422. Repetir la clave de una matrícula ya anulada da 409 `ENROLLMENT_ANNULLED`.\n\n**Resultado incierto (504).** Si Cupos no responde a tiempo, el cupo pudo haberse ocupado. La matrícula queda `PENDIENTE`: reintenta con la misma clave o consulta `GET /v1/enrollments/{id}`. Si no se confirma dentro del TTL, se anula automáticamente y se libera el cupo.",
         "operationId": "matricular_v1_enrollments_post",
         "parameters": [
           {
@@ -705,7 +1009,7 @@
             }
           },
           "409": {
-            "description": "Ya matriculado, matrícula en proceso o sin cupos",
+            "description": "Ya matriculado, matrícula en proceso, anulada o sin cupos",
             "content": {
               "application/json": {
                 "schema": {
@@ -715,7 +1019,17 @@
             }
           },
           "422": {
-            "description": "Datos inválidos o Idempotency-Key reutilizada con otra solicitud",
+            "description": "Datos inválidos o Idempotency-Key reutilizada con otro curso",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Demasiadas operaciones por minuto (clave de estudiante)",
             "content": {
               "application/json": {
                 "schema": {
@@ -787,6 +1101,7 @@
             "required": false,
             "schema": {
               "type": "integer",
+              "maximum": 100000,
               "minimum": 0,
               "default": 0,
               "title": "Offset"
@@ -981,6 +1296,26 @@
               }
             }
           },
+          "429": {
+            "description": "Demasiadas operaciones por minuto (clave de estudiante)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "El cupo se liberó pero no se pudo guardar; repetir",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "502": {
             "content": {
               "application/json": {
@@ -1124,14 +1459,28 @@
           "key_prefix": {
             "type": "string",
             "title": "Key Prefix",
+            "description": "Identificador público de la clave; no revela el secreto.",
             "examples": [
-              "mat_Ab3k"
+              "mat_1a2b3c4d"
             ]
           },
           "created_at": {
             "type": "string",
             "format": "date-time",
             "title": "Created At"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At",
+            "description": "Vencimiento (null = no caduca)"
           }
         },
         "type": "object",
@@ -1152,8 +1501,9 @@
           "key_prefix": {
             "type": "string",
             "title": "Key Prefix",
+            "description": "Identificador público de la clave; no revela el secreto.",
             "examples": [
-              "mat_Ab3k"
+              "mat_1a2b3c4d"
             ]
           },
           "created_at": {
@@ -1161,12 +1511,25 @@
             "format": "date-time",
             "title": "Created At"
           },
+          "expires_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At",
+            "description": "Vencimiento (null = no caduca)"
+          },
           "api_key": {
             "type": "string",
             "title": "Api Key",
             "description": "Valor completo de la clave. Se muestra UNA sola vez: no se puede recuperar.",
             "examples": [
-              "mat_Ab3kD9..."
+              "mat_1a2b3c4d.Zx9..."
             ]
           }
         },
@@ -1178,6 +1541,51 @@
           "api_key"
         ],
         "title": "ApiKeyIssued"
+      },
+      "CourseList": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/CourseOut"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "title": "CourseList"
+      },
+      "CourseOut": {
+        "properties": {
+          "curso_id": {
+            "type": "integer",
+            "title": "Curso Id"
+          },
+          "nombre": {
+            "type": "string",
+            "title": "Nombre"
+          },
+          "cupos_totales": {
+            "type": "integer",
+            "title": "Cupos Totales"
+          },
+          "cupos_libres": {
+            "type": "integer",
+            "title": "Cupos Libres",
+            "description": "Referencial: puede estar desactualizado hasta `CURSOS_CACHE_TTL_SECONDS` segundos. La verdad la decide POST /v1/enrollments."
+          }
+        },
+        "type": "object",
+        "required": [
+          "curso_id",
+          "nombre",
+          "cupos_totales",
+          "cupos_libres"
+        ],
+        "title": "CourseOut"
       },
       "EnrollmentCreate": {
         "properties": {

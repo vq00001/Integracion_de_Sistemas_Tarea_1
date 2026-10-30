@@ -1,6 +1,6 @@
 # D1 - Estilo de integración y descomposición
 
-**Estado:** aceptada (revisada tras la evaluación: se agrega el análisis de los datos duplicados).
+**Estado:** aceptada (revisada: análisis de los datos duplicados; revisión 3: se expone la lectura de disponibilidad con un caché de TTL corto y se declaran sus límites).
 
 El Centro de Formación Técnica AprendeMás opera dos sistemas que nacieron y evolucionaron de manera independiente: *Cupos*, responsable de administrar cursos y disponibilidad, y *Matrículas*, encargado del registro de estudiantes y matrículas. Para confirmar una matrícula, Matrículas necesita consultar frecuentemente el estado de los cupos disponibles y actualizar dicha información de forma consistente.
 
@@ -48,3 +48,16 @@ Separar los servicios obliga a que cada uno guarde las referencias que necesita 
 - *Sin transacción distribuida:* no existe una transacción entre las dos bases de datos. La consistencia se obtiene con una secuencia de pasos idempotentes y compensables (saga), no con atomicidad.
 
 **Qué se revisaría si cambia el contexto.** Si el catálogo de cursos pasara a tener cambios frecuentes (renombres, bajas), convendría que Cupos publicara eventos de cambio y que Matrículas mantuviera una copia de solo lectura del catálogo, aceptando consistencia eventual en esa parte.
+
+## Lectura de disponibilidad: la consulta "muy frecuente" y su caché
+El encargo subraya que Matrículas consulta la disponibilidad **con muchísima frecuencia**, pero hasta la revisión 3 la API pública no exponía ninguna ruta de lectura: los RPC `obtenerCupo`, `listarCursos` y `listarCursosDisponibles` solo se usaban en pruebas, y un portal no podía ni descubrir qué `curso_id` existen. Ahora existen `GET /v1/courses` (con `?disponibles=true`) y `GET /v1/courses/{curso_id}`.
+
+**Decisión.** Esas rutas se sirven de un **caché en memoria de la API con TTL corto** (`CURSOS_CACHE_TTL_SECONDS`, 5 s por defecto; `Cache-Control: private, max-age=<TTL>` y `X-Cache: HIT|MISS` en la respuesta). El caché se **invalida** cuando esta API ocupa o libera un cupo, y evita la estampida: si el TTL vence con muchas solicitudes en vuelo, solo una va a Cupos.
+
+**Por qué es seguro hacerlo aquí y no en la escritura.** El número que devuelve la lectura es **referencial**: quien decide si hay cupo es siempre `POST /v1/enrollments` → `ocuparCupo` (atómico, con `UPDATE ... WHERE cupos_libres > 0`). Un dato cacheado puede decir "queda 1" y la matrícula responder `409 SIN_CUPOS`; eso es correcto. El camino de escritura **no** pasa por el caché.
+
+**Costos y límites declarados.**
+- Consistencia eventual acotada por el TTL: con varias réplicas de la API, las demás ven el dato viejo hasta que venza el TTL (la invalidación es por proceso). Una matrícula hecha por otro canal directo a Cupos tampoco invalida el caché.
+- **No** es la caché con Redis del requisito opcional O1: es un caché por proceso. No se afirma cumplir O1.
+- Si Cupos está caído, las lecturas con caché vencido fallan con 503 (no se sirve un dato viejo "por si acaso").
+- No se midió aún cuánto reduce las llamadas a Cupos bajo carga real; el diseño lo permite (N consultas/s → ~1/TTL llamadas/s) pero queda sin medir.

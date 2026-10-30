@@ -16,14 +16,17 @@ Dos tipos de credencial (ambas en `X-API-Key`):
 
 1. ADMIN (`API_KEYS`, variable de entorno): acceso total. Es la clave de la
    secretaría / integraciones internas y la única que puede crear estudiantes,
-   listarlos y emitir o revocar keys de estudiante. Si el valor configurado es el
-   predeterminado público (`DEFAULT_ADMIN_API_KEY`) se deja un WARNING en el log al
-   arrancar y en CADA request que la use.
+   listarlos y emitir o revocar keys de estudiante. NO existe un valor por defecto: si
+   `API_KEYS` falta, es una clave pública conocida o tiene menos de 24 caracteres, la API
+   se niega a arrancar (`config.validar_claves_admin`).
 
 2. ESTUDIANTE (tabla `api_keys`): se emite a demanda, una activa por estudiante, y
    solo permite operar sobre los recursos de ese estudiante (su ficha y sus
    matrículas). Se guarda solo el hash SHA-256; el valor en claro se entrega una
-   única vez al emitirla.
+   única vez al emitirla. Caduca a los `STUDENT_KEY_TTL_DAYS` días (90 por defecto).
+
+Defensa contra abuso (ver ratelimit.py): los intentos de autenticación fallidos se limitan por
+IP (429 + Retry-After) y las escrituras de un estudiante con clave propia, por minuto.
 
 Semántica de los códigos (RFC 9110):
 - 401 Unauthorized: la credencial falta o NO autentica (inexistente, inválida o
@@ -45,7 +48,6 @@ import hmac
 import logging
 import secrets
 from dataclasses import dataclass
-
 from fastapi import Depends, Header, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -53,14 +55,22 @@ from starlette import status
 from starlette.exceptions import HTTPException
 
 from . import models
-from .config import DEFAULT_ADMIN_API_KEY, settings
+from .config import settings
 from .database import get_db
+from .errors import TooManyRequestsError
+from .ratelimit import LimitadorVentana
+from .time import utc_now
 
 log = logging.getLogger("matriculas.security")
 
 # Prefijo legible: permite reconocer una clave de estudiante (y detectar fugas con
-# escáneres de secretos) sin que el prefijo revele nada del secreto.
+# escáneres de secretos). Formato: mat_<id público de 8 hex>.<secreto>. El id público es
+# ALEATORIO e independiente del secreto: mostrarlo en listados/logs no revela ni un carácter
+# de él (antes se mostraban los primeros 4 caracteres del propio secreto).
 STUDENT_KEY_PREFIX = "mat_"
+
+_limitador_fallos = LimitadorVentana(settings.auth_fail_limit, settings.auth_fail_window_seconds)
+_limitador_escrituras = LimitadorVentana(settings.write_rate_limit_per_minute, 60.0)
 
 
 @dataclass(frozen=True)
@@ -75,9 +85,10 @@ class Principal:
 # Claves de estudiante
 # ---------------------------------------------------------------------------
 
-def generar_api_key() -> str:
-    """Token aleatorio de 256 bits (mat_<urlsafe>)."""
-    return STUDENT_KEY_PREFIX + secrets.token_urlsafe(32)
+def generar_api_key() -> tuple[str, str]:
+    """Devuelve (clave_completa, prefijo_publico). Secreto aleatorio de 256 bits."""
+    prefijo = f"{STUDENT_KEY_PREFIX}{secrets.token_hex(4)}"
+    return f"{prefijo}.{secrets.token_urlsafe(32)}", prefijo
 
 
 def hash_api_key(clave: str) -> str:
@@ -98,25 +109,6 @@ def _es_admin(candidata: str) -> str | None:
     return coincidencia
 
 
-def advertir_clave_por_defecto() -> None:
-    """Aviso al arrancar si la clave admin configurada es la predeterminada."""
-    if DEFAULT_ADMIN_API_KEY in settings.admin_api_keys:
-        log.warning(
-            "SEGURIDAD: la API key admin es el valor PREDETERMINADO público del repositorio. "
-            "Cualquiera con acceso al código puede usarla. Define API_KEYS con un valor "
-            "propio (python -c \"import secrets; print(secrets.token_urlsafe(32))\")."
-        )
-
-
-def _log_uso_clave_por_defecto(request: Request) -> None:
-    cliente = request.client.host if request.client else "desconocido"
-    log.warning(
-        "SEGURIDAD: se autenticó con la API key admin PREDETERMINADA (%s %s, cliente=%s). "
-        "Reemplázala por una clave propia en API_KEYS.",
-        request.method, request.url.path, cliente,
-    )
-
-
 def _no_autenticado(detalle: str) -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -125,30 +117,57 @@ def _no_autenticado(detalle: str) -> HTTPException:
     )
 
 
+def _ip(request: Request) -> str:
+    return request.client.host if request.client else "desconocido"
+
+
+def _fallo_de_autenticacion(request: Request, detalle: str) -> HTTPException:
+    _limitador_fallos.registrar(_ip(request))
+    return _no_autenticado(detalle)
+
+
 def require_api_key(
     request: Request,
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     db: Session = Depends(get_db),
 ) -> Principal:
-    """Autentica la solicitud y devuelve quién es. Lanza 401 si no autentica."""
+    """Autentica la solicitud y devuelve quién es. 401 si no autentica; 429 si la IP agotó
+    sus intentos fallidos (se rechaza ANTES de comparar la clave, para no regalar un oráculo)."""
+    espera = _limitador_fallos.excedido(_ip(request))
+    if espera is not None:
+        raise TooManyRequestsError(
+            "Demasiados intentos de autenticación fallidos. Espera antes de reintentar.",
+            retry_after=espera,
+        )
     if not x_api_key:
-        raise _no_autenticado("Falta la cabecera X-API-Key")
+        raise _fallo_de_autenticacion(request, "Falta la cabecera X-API-Key")
 
-    admin = _es_admin(x_api_key)
-    if admin is not None:
-        if admin == DEFAULT_ADMIN_API_KEY:
-            _log_uso_clave_por_defecto(request)
+    if _es_admin(x_api_key) is not None:
         return Principal(es_admin=True)
 
     fila = db.execute(
-        select(models.ApiKey.student_id).where(
+        select(models.ApiKey.student_id, models.ApiKey.expires_at).where(
             models.ApiKey.key_hash == hash_api_key(x_api_key),
             models.ApiKey.revoked_at.is_(None),
         )
-    ).scalar_one_or_none()
+    ).first()
     if fila is None:
-        raise _no_autenticado("API key inválida")
-    return Principal(es_admin=False, student_id=fila)
+        raise _fallo_de_autenticacion(request, "API key inválida")
+    student_id, expires_at = fila
+    if expires_at is not None and expires_at <= utc_now():
+        raise _fallo_de_autenticacion(request, "API key vencida: solicita una nueva al administrador")
+    return Principal(es_admin=False, student_id=student_id)
+
+
+def limitar_escrituras(principal: Principal) -> None:
+    """429 si un estudiante con clave propia supera sus escrituras por minuto."""
+    if principal.es_admin:
+        return
+    espera = _limitador_escrituras.consumir(principal.student_id or "")
+    if espera is not None:
+        raise TooManyRequestsError(
+            "Demasiadas operaciones en poco tiempo. Espera antes de reintentar.", retry_after=espera
+        )
 
 
 # ---------------------------------------------------------------------------

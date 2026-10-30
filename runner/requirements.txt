@@ -1,9 +1,18 @@
-# Dependencias del contenedor que ejecuta pruebas y experimentos
-pytest>=8
-requests>=2.32
+# Dependencias del contenedor que ejecuta pruebas y experimentos (versiones fijas)
+pytest==9.2.0
+requests==2.33.1
 grpcio==1.84.0
 grpcio-tools==1.84.0
-pyyaml>=6
-jsonschema>=4.21
-pandas>=2.2
-matplotlib>=3.9
+protobuf==7.36.2
+PyYAML==6.0.3
+jsonschema==4.26.0
+pandas==3.0.2
+matplotlib==3.10.8
+# Pruebas unitarias en proceso de la API (tests/unit): mismas versiones que matriculas-api
+fastapi==0.141.1
+httpx==0.28.1
+sqlalchemy==2.0.54
+pydantic==2.13.5
+pydantic-settings==2.15.0
+python-dotenv==1.2.2
+email-validator==2.2.0

@@ -82,10 +82,13 @@ def _drenar_pendientes(api, limite_s: float = 45):
     pytest.fail("quedaron matrículas PENDIENTE de pruebas anteriores sin conciliar")
 
 
-@pytest.fixture
-def cupos_lento(api):
-    """Cupos tarda 3 s (> timeout de 2 s). La API arranca con TTL largo y
-    conciliador rápido para que la prueba sea corta.
+def _poner_cupos_lento(api, modo: str):
+    """Cupos tarda 3 s (> timeout de 2 s). La API arranca con TTL largo y conciliador rápido para
+    que la prueba sea corta.
+
+    `modo` = "despues": Cupos confirma la operación y la RESPUESTA llega tarde (resultado
+    genuinamente incierto: deja cupo huérfano) | "antes": Cupos tarda ANTES de procesar y, como
+    ahora verifica el deadline del cliente, no confirma nada.
 
     Antes de ralentizar Cupos se drenan las matrículas PENDIENTE que dejaron otras pruebas
     (con Cupos rápido y TTL de 1 s), para que la prueba parta de un estado conocido."""
@@ -99,15 +102,32 @@ def cupos_lento(api):
 
     env_api = {"PENDING_TTL_SECONDS": "40", "RECONCILE_INTERVAL_SECONDS": "2",
                "CUPOS_CB_RECOVERY_SECONDS": "2"}
-    compose("up", "-d", "cupos", env={"SIMULAR_LATENCIA_MS": "3000"})
+    compose("up", "-d", "cupos", env={"SIMULAR_LATENCIA_MS": "3000", "SIMULAR_LATENCIA_MODO": modo})
     compose("up", "-d", "--no-deps", "matriculas-api", env=env_api)
     time.sleep(2)
     esperar_api(api)
-    yield env_api
-    compose("up", "-d", "cupos")  # latencia 0 (valor por defecto)
+    return env_api
+
+
+def _restaurar_normal(api):
+    compose("up", "-d", "cupos")  # latencia 0 y modo por defecto
     compose("up", "-d", "--no-deps", "matriculas-api")  # configuración por defecto
     time.sleep(2)
     esperar_api(api)
+
+
+@pytest.fixture
+def cupos_lento(api):
+    """Cupos lento DESPUÉS de confirmar (el caso incierto que exige conciliador)."""
+    yield _poner_cupos_lento(api, "despues")
+    _restaurar_normal(api)
+
+
+@pytest.fixture
+def cupos_lento_antes(api):
+    """Cupos lento ANTES de procesar (el deadline vence y Cupos no confirma)."""
+    yield _poner_cupos_lento(api, "antes")
+    _restaurar_normal(api)
 
 
 def _libres(cupos_stub):
@@ -179,3 +199,30 @@ def test_reintentar_tras_timeout_con_la_misma_clave_consume_un_solo_cupo(api, es
 
     api.post(f"/v1/enrollments/{enrollment_id}/revert")  # limpieza
     assert _libres(cupos_stub) == libres_antes
+
+
+@pytest.mark.grpc
+def test_cupos_lento_antes_de_procesar_no_deja_cupo_huerfano(api, estudiante, cupos_stub, cupos_lento_antes):
+    """Mitigación en el origen: si el cliente se fue antes de que Cupos procesara, Cupos verifica
+    el deadline y NO confirma. Hay 504 y matrícula PENDIENTE, pero ningún cupo retenido."""
+    libres_antes = _libres(cupos_stub)
+    r = api.post("/v1/enrollments", json={"student_id": estudiante["id"], "curso_id": CURSO})
+    assert r.status_code == 504, r.text
+    enrollment_id = r.json()["error"]["details"]["enrollment_id"]
+    assert api.get(f"/v1/enrollments/{enrollment_id}").json()["estado"] == "PENDIENTE"
+    time.sleep(3.5)   # Cupos termina de dormir y NO debe confirmar nada
+    assert _libres(cupos_stub) == libres_antes, "Cupos confirmó una ocupación de la que el cliente ya se había ido"
+
+
+def test_cupos_inalcanzable_no_deja_la_matricula_pendiente(api, estudiante, cupos_caido):
+    """Con Cupos caído la conexión se rechaza: la solicitud nunca salió, no hay nada incierto, así
+    que la intención se borra y el estudiante NO queda bloqueado por una matrícula PENDIENTE.
+    Si el circuito devuelve 504, el resultado es incierto y la matrícula queda PENDIENTE
+    para que el conciliador la cierre."""
+    r = api.post("/v1/enrollments", json={"student_id": estudiante["id"], "curso_id": CURSO})
+    pendientes = api.get("/v1/enrollments", params={"student_id": estudiante["id"], "estado": "PENDIENTE"}).json()
+    assert r.status_code in (503, 504), r.text
+    if r.status_code == 503:
+        assert pendientes["total"] == 0, "una solicitud que nunca salió dejó una matrícula PENDIENTE"
+    else:
+        assert pendientes["total"] == 1, "un timeout debe conservar la matrícula PENDIENTE"

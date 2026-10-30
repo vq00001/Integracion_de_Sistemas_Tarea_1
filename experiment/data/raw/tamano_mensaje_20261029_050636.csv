@@ -1,0 +1,4 @@
+respuesta,bytes_protobuf,bytes_json,bytes_json_gzip,json_sobre_protobuf,us_protobuf_ida_vuelta,us_json_ida_vuelta
+obtenerCupo,2,19,39,9.50,0.38,2.26
+ocuparCupo,2,25,43,12.50,0.34,2.19
+listarCursos(5),151,430,209,2.85,0.71,7.92

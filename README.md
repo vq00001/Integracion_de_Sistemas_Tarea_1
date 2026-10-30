@@ -20,23 +20,25 @@ defecto.
 
 ```
 .
-├── docker-compose.yml     # orquesta TODOS los servicios (cupos + matriculas-db + matriculas-api [+ matriculas, legacy])
-├── .env.example           # plantilla de configuración (el .env real NO se versiona)
+├── docker-compose.yml       # orquesta TODOS los servicios (cupos + matriculas-db + matriculas-api [+ matriculas, legacy])
+├── .env.example             # plantilla SIN secretos; el .env real se genera con scripts/generar_env.py
+├── scripts/                 # generar_env.py, ejecutar_tests.py, verificar_compatibilidad.py
+├── contrato-base/           # último contrato PUBLICADO (.proto y OpenAPI): base de la verificación de compatibilidad
 ├── proto/
 │   └── cupos.proto          # contrato gRPC de Cupos, paquete cupo.v1 (fuente de verdad de la integración)
-├── docs/adr/                # ADR D1–D4 + D5 (autenticación)
+├── docs/adr/                # ADR D1–D4 + D5 (autenticación, transporte, privacidad)
 ├── experiment/              # scripts, datos crudos (data/raw) y figuras de los experimentos
-├── tests/                   # grpc/, integration/ y contract/
-├── cupos/                   # servicio Cupos (Python + gRPC + SQLite) - sin cambios
+├── tests/                   # grpc/, integration/, contract/ y unit/ (unitarias en proceso, sin Docker)
+├── cupos/                   # servicio Cupos (Python + gRPC + SQLite)
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── src/
 │       ├── server.py
-│       └── generar.py        # genera los stubs (*_pb2.py) desde proto/cupos.proto
-├── matriculas-api/          # ★ API REST de Matrículas (Python + FastAPI) - la integración
+│       └── generar.py       # genera los stubs (*_pb2.py) desde proto/cupos.proto
+├── matriculas-api/          # API REST de Matrículas (Python + FastAPI) - la integración
 │   ├── Dockerfile
 │   ├── requirements.txt
-│   ├── README.md             # autenticación, resiliencia, endpoints, cómo correrla
+│   ├── README.md            # autenticación, resiliencia, endpoints, cómo correrla
 │   ├── generar_stubs.py / exportar_openapi.py
 │   └── docs/openapi.{json,yaml}   # contrato REST versionado
 │   └── app/
@@ -46,7 +48,8 @@ defecto.
 │       ├── grpc_client.py + circuit_breaker.py  # cliente gRPC resiliente hacia Cupos
 │       ├── reconciler.py     # cierra matrículas PENDIENTES (resultado incierto tras un timeout)
 │       ├── rut.py            # validación del RUT (módulo 11)
-│       └── routers/          # students, enrollments, health
+│       ├── cursos_cache.py   # caché en memoria (TTL corto) de la disponibilidad de cursos
+│       └── routers/          # students, enrollments, courses, health
 └── matriculas/               # CLI legado (Node.js + Postgres) - "antes de la integración"
     ├── Dockerfile
     ├── package.json
@@ -83,21 +86,20 @@ descrito en el enunciado.
 ### Levantar la integración completa (Cupos + Matrículas API)
 
 ```bash
-docker compose up --build -d cupos matriculas-db matriculas-api
+python scripts/generar_env.py          # una vez: crea .env con claves ALEATORIAS (no pisa uno existente)
+docker compose up --build -d           # levanta cupos + matriculas-db + matriculas-api (los servicios sin profile)
 ```
 
-(`.env` es opcional; sin él se usan los valores por defecto de desarrollo.
-Para personalizarlos: `cp .env.example .env`. Ese archivo no se versiona.)
-
-Solo el puerto `8000` (API pública) se publica en el host. El gRPC de Cupos y
-Postgres son internos y no se exponen; para inspeccionar la base:
+Solo el puerto `8000` (API pública) se publica en el host, y **solo en `127.0.0.1`** (`API_BIND`): la API
+habla HTTP sin TLS, así que no se expone a la red sin un proxy TLS delante (ver `docs/adr/D5-...`).
+El gRPC de Cupos y Postgres son internos y no se exponen; para inspeccionar la base:
 `docker compose exec matriculas-db psql -U matriculas_user -d matriculas_db`.
 
 La API REST de Matrículas queda en `http://localhost:8000` (docs en
-`/docs`). Ver `matriculas-api/README.md` para ejemplos de uso con
+`/docs`; desactívalos en producción con `DOCS_ENABLED=false`). Ver `matriculas-api/README.md` para ejemplos de uso con
 `curl`, la lista de endpoints y el mecanismo de autenticación.
 
-### (Referencia) CLI legado de Matrículas, sin integración con Cupos
+### CLI legado de Matrículas, sin integración con Cupos
 
 Se mantiene solo para comparar el comportamiento "antes de la
 integración". No se levanta con `docker compose up` por defecto (usa un
@@ -130,31 +132,30 @@ con `run`, y se detienen solos al terminar.
 ### Pruebas
 
 ```bash
-docker compose run --rm --build tests                 # suite completa (48 pruebas)
+docker compose run --rm --build tests                 # suite completa (122 pruebas)
 docker compose run --rm tests --rapido                # sin las pruebas que apagan contenedores
 docker compose run --rm tests -k idempotency          # cualquier otro argumento va a pytest
 ```
 
 El contenedor levanta lo que falte, espera a la API, ejecuta pytest, **borra los cachés de la
-corrida** (`__pycache__`, `.pytest_cache`, `tests/.generated`) y, por defecto, **restablece el
-estado**: elimina los contenedores y los volúmenes de datos de Cupos y Matrículas, para que la
-próxima corrida parta de cero y no herede cupos retenidos de pruebas anteriores. Para conservar
-el sistema levantado: `RESET_ESTADO=0 docker compose run --rm tests`. Termina con el código de
-salida de pytest (0 = todo bien).
+corrida** (`__pycache__`, `.pytest_cache`, `tests/.generated`). El **restablecimiento del estado**
+(eliminar contenedores y **volúmenes con datos** de Cupos y Matrículas, para que la próxima corrida
+parta de cero) ahora está **apagado por defecto**, porque borra datos: se activa a propósito con
+`--reset-estado` o `RESET_ESTADO=1`, solo en una máquina donde no haya nada que conservar. Cupos ya no
+permite "limpiar" liberando con claves inventadas (esa era la vulnerabilidad), así que una corrida que
+deje cupos retenidos se limpia con el conciliador o con `docker compose down -v`. Termina con el código
+de salida de pytest (0 = todo bien).
 
 ### Experimentos
 
 ```bash
-docker compose run --rm --build experimentos          # 3 repeticiones (20 a 30 minutos)
-docker compose run --rm experimentos --rapido         # prueba de humo (pocos minutos)
+docker compose run --rm --build experimentos          # 3 repeticiones, TTL real (~45 a 60 minutos)
+docker compose run --rm experimentos --rapido         # prueba de humo (~10 min; TTL 6 s, solo para validar)
 docker compose run --rm experimentos --reps 5
 docker compose run --rm experimentos --solo-graficar  # regenera figuras con los últimos CSV
 ```
 
-Ejecuta el experimento 1 (timeout y circuit breaker) y el 2 (consistencia de cupos), genera las
-figuras y deja el sistema en su configuración normal. Los resultados quedan en tu carpeta:
-datos crudos en `experiment/data/raw/`, figuras en `experiment/results/` y las tablas resumen
-(para el Cuadro 1 del informe) en `experiment/results/resumen_<fecha>.txt`.
+Cada escenario recrea los contenedores con configuración explícita y **verifica y registra la configuración efectiva**. Los datos de la versión anterior se archivaron en `experiment/data/archivo_rev/` (ya no son comparables, ver su LEEME). Los resultados quedan en las carpetas `experiment/data/raw/` para los datos crudos, figuras en `experiment/results/` y las tablas resumen en `experiment/results/resumen_<fecha>.txt`.
 
 ### Sin contenedor
 
@@ -168,7 +169,9 @@ python experiment/ejecutar_todo.py [--rapido] [--reps 3]
 ### Requisitos y notas
 
 - Los contenedores usan el socket de Docker del anfitrión (`/var/run/docker.sock`) porque las
-  pruebas de falla y los experimentos apagan y reinician contenedores. En Docker Desktop
+  pruebas de falla y los experimentos apagan y reinician contenedores. **Es un riesgo conocido**: el
+  socket equivale a root en el anfitrión. Por eso solo existe en los perfiles `tests` y `experimentos` (que
+  nunca arrancan con `docker compose up`) y no debe usarse en un servidor compartido. En Docker Desktop
   (Windows/macOS) funciona sin configuración adicional.
 - El proyecto de compose tiene un nombre fijo (`name: integracion-sistemas-t1`) para que los
   contenedores ejecutores controlen exactamente los mismos servicios. Si ya tenías el sistema
@@ -188,23 +191,34 @@ cuando Cupos está caído o lento, y el **contrato OpenAPI** (O4).
 ### Requisitos
 
 ```bash
+python scripts/generar_env.py                 # una vez
 python -m pip install -r tests/requirements.txt
-docker compose -f docker-compose.yml -f docker-compose.test.yml up --build -d cupos matriculas-db matriculas-api
+docker compose -f docker-compose.yml -f docker-compose.test.yml up --build -d
 ```
 
 (El archivo `docker-compose.test.yml` publica el gRPC de Cupos solo en
-`127.0.0.1:50051` para las pruebas de contrato.)
+`127.0.0.1:50051` para las pruebas de contrato.) Las pruebas toman la clave admin de `API_KEY`,
+`MATRICULAS_API_KEYS` o del `.env`; no existe un valor por defecto.
 
 ### Ejecutar
 
 ```bash
-python -m pytest tests -m "not falla" -q     # pruebas normales (42)
-python -m pytest tests -m falla -q           # detienen/reinician contenedores (6), sin paralelismo
-python -m pytest tests -q                    # todas (48)
+python -m pytest tests -m "not falla" -q     # pruebas normales (114)
+python -m pytest tests -m falla -q           # detienen/reinician contenedores (8), sin paralelismo
+python -m pytest tests -q                    # todas (122)
+python scripts/verificar_compatibilidad.py   # compatibilidad de .proto y OpenAPI contra contrato-base/
 ```
 
-Por categoría: `tests/grpc`, `tests/integration`, `tests/contract`, o por
-marcador (`-m grpc`).
+Por categoría: `tests/grpc`, `tests/integration`, `tests/contract`, `tests/unit` (en proceso, sin
+Docker ni servicios: `python -m pytest tests/unit`), o por marcador (`-m grpc`).
+
+**Qué se ejecutó y dónde.** Al preparar esta revisión las pruebas normales y unitarias se ejecutaron contra
+Cupos y la API levantados como **procesos locales** (no en Docker) y las pruebas de falla con un doble de
+`docker compose` que reinicia esos procesos. Lo que **no** se pudo ejecutar fuera de Docker: la construcción
+de las imágenes, el `docker-compose.yml` (solo se validó su sintaxis YAML), la API sobre PostgreSQL (se probó
+sobre SQLite; las sentencias de migración de PostgreSQL no se ejecutaron) y los experimentos con datos
+reales de Docker (los scripts se ejecutaron de punta a punta contra el doble para validar su lógica, pero
+esos datos no se incluyen). Hay que correr `docker compose run --rm --build tests` y `experimentos`.
 
 ## Historial de versiones del contrato
 
@@ -213,9 +227,20 @@ marcador (`-m grpc`).
 | 2026-09-25 | REST `/v1`, gRPC `cupo` | Versión inicial | — |
 | 2026-10-21 | gRPC `cupo` → **`cupo.v1`** | Se versiona el `package` | Cambio de nombre del servicio; ambos extremos se regeneran juntos (aún sin consumidores externos) |
 | 2026-10-21 | REST `/v1` | Cabecera opcional `Idempotency-Key`; estado `PENDIENTE`; respuestas `502`/`504`; clave inválida `403`→`401`; RUT validado | Ver tabla en `docs/adr/D3-...` |
+| 2026-10-29 | gRPC `cupo.v1` + REST `/v1` (**1.1.0**) | RPC `consultarOperacion`; rutas `GET /v1/courses[/{id}]` y `DELETE /v1/students/{id}`; `expires_at` en las claves; `409 ENROLLMENT_ANNULLED` y `429`; `liberarCupo` exige que la clave haya ocupado; clave de idempotencia por estudiante | Aditivo en el esquema (verificado por `scripts/verificar_compatibilidad.py`) + cambios de comportamiento clasificados en `docs/adr/D3-...` |
 
 ## Declaración de uso de Inteligencia Artificial
 
 En el desarrollo de este trabajo, se utilizó inteligencia artificial como herramienta de apoyo para la revisión y corrección de aspectos sintácticos del código, la identificación y comparación de alternativas de implementación, la generalización de secciones repetitivas y la documentación del código.
 
 Asimismo, durante la elaboración del informe, se empleó para mejorar la redacción de los textos y adaptar el contenido al formato LaTeX, facilitando la preparación y compilación del documento. En todos los casos, su uso tuvo como objetivo apoyar el proceso de desarrollo y documentación del trabajo.
+
+### Detalle: herramienta, usos y verificación (§6.3)
+
+| | |
+|---|---|
+| **Herramienta** | Claude (Anthropic), a través de la interfaz web/móvil. |
+| **Usos en la revisión 3** | Lectura de la evaluación y del código; corrección de Cupos, de la API y de las pruebas; reescritura de los scripts de experimento; medición de tamaño de mensajes (D2); redacción de D1–D5, READMEs y `docs/CORRECCIONES_REV3.md`. |
+| **Usos en entregas anteriores** | `[COMPLETAR: herramienta, para qué y en qué archivos]` |
+| **Qué NO hizo la herramienta** | No ejecutó Docker ni PostgreSQL; no generó los datos de los experimentos 1–3 con el sistema real; no redactó el informe PDF ni grabó el video. |
+| **Verificación por integrante** | Persona 1: `[COMPLETAR: qué revisó/ejecutó y qué entiende]` · Persona 2: `[COMPLETAR]` · Persona 3: `[COMPLETAR]` |

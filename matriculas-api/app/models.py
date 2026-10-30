@@ -8,6 +8,7 @@ from sqlalchemy import CheckConstraint, DateTime, Enum, ForeignKey, Index, Integ
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
+from .time import utc_now
 
 
 def _uuid() -> str:
@@ -27,6 +28,11 @@ ESTADOS_ACTIVOS_SQL = "estado IN ('PENDIENTE','CONFIRMADA')"
 
 class Student(Base):
     __tablename__ = "students"
+    __table_args__ = (
+        # El correo se guarda en minúsculas (ver schemas.StudentCreate) y además la base lo
+        # exige único sin distinguir mayúsculas: Ana@x.com y ana@x.com no pueden coexistir.
+        Index("uq_student_email_lower", text("lower(email)"), unique=True),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     rut: Mapped[str] = mapped_column(String(12), nullable=False, unique=True, index=True)
@@ -34,10 +40,13 @@ class Student(Base):
     apellido: Mapped[str] = mapped_column(String(150), nullable=False)
     email: Mapped[str] = mapped_column(String(150), nullable=False, unique=True)
     telefono: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+        DateTime, default=utc_now, onupdate=utc_now
     )
+    # Fecha en que se anonimizaron sus datos personales (derecho de supresión). Las matrículas
+    # se conservan como historial sin datos personales. Ver DELETE /v1/students/{id}.
+    anonimizado_en: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     matriculas: Mapped[list["Enrollment"]] = relationship(
         back_populates="estudiante", cascade="all, delete-orphan"
@@ -71,8 +80,10 @@ class Enrollment(Base):
             postgresql_where=text(ESTADOS_ACTIVOS_SQL),
             sqlite_where=text(ESTADOS_ACTIVOS_SQL),
         ),
-        # Clave de idempotencia entregada por el cliente (cabecera Idempotency-Key).
-        Index("uq_matricula_client_key", "client_key", unique=True),
+        # Clave de idempotencia entregada por el cliente (cabecera Idempotency-Key). Es única
+        # POR ESTUDIANTE (antes era global): un estudiante ya no puede averiguar si otro usó
+        # una clave, ni "quemar" claves ajenas.
+        Index("uq_matricula_student_client_key", "student_id", "client_key", unique=True),
         CheckConstraint(
             "estado IN ('PENDIENTE','CONFIRMADA','RECHAZADA','ANULADA')", name="ck_estado_valido"
         ),
@@ -96,9 +107,9 @@ class Enrollment(Base):
     # Cabecera Idempotency-Key enviada por el cliente de la API REST (opcional).
     # Si el cliente reintenta con la misma clave, recibe la misma matrícula.
     client_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+        DateTime, default=utc_now, onupdate=utc_now
     )
 
     estudiante: Mapped["Student"] = relationship(back_populates="matriculas")
@@ -130,9 +141,12 @@ class ApiKey(Base):
         String(36), ForeignKey("students.id", ondelete="CASCADE"), nullable=False, index=True
     )
     key_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
-    # Primeros caracteres de la clave: sirven para identificarla en logs/listados sin exponerla.
+    # Identificador PÚBLICO de la clave (mat_<8 hex aleatorios>): sirve para reconocerla en logs y
+    # listados. Es independiente del secreto: no revela ningún carácter de él.
     key_prefix: Mapped[str] = mapped_column(String(12), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
+    # Vencimiento (None = no caduca). Una clave vencida deja de autenticar (401).
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     estudiante: Mapped["Student"] = relationship(back_populates="api_keys")

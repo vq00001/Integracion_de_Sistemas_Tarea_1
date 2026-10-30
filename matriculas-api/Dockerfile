@@ -15,6 +15,10 @@ COPY proto ./proto
 # no se versionan en git, así que el build nunca usa stubs desactualizados.
 RUN python generar_stubs.py
 
+# Usuario sin privilegios (la API solo escucha el puerto 8000 y habla con Postgres/Cupos por red).
+RUN useradd --system --uid 10001 --no-create-home app
+USER app
+
 EXPOSE 8000
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

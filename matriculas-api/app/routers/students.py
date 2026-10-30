@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import timedelta
 
 from fastapi import APIRouter, Depends, Query, Response, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
+from ..config import settings
 from ..database import get_db
 from ..errors import ConflictError, NotFoundError
 from ..rut import normalizar_rut
@@ -19,6 +20,7 @@ from ..security import (
     require_admin,
     require_api_key,
 )
+from ..time import utc_now
 
 router = APIRouter(
     prefix="/v1/students",
@@ -80,6 +82,47 @@ def obtener_estudiante(
     return estudiante
 
 
+@router.delete(
+    "/{student_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Anonimizar a un estudiante: derecho de supresión (solo administrador)",
+    description=(
+        "Elimina los datos personales del estudiante (RUT, nombre, apellido, correo, teléfono) "
+        "reemplazándolos por valores anónimos, revoca su API key y conserva sus matrículas como "
+        "historial **sin datos personales** (no se borran para no romper el registro de cupos). "
+        "Es idempotente: repetirla devuelve 204. No se puede deshacer."
+    ),
+    responses={
+        401: {"model": schemas.ErrorResponse},
+        403: {"model": schemas.ErrorResponse, "description": "Requiere API key de administrador"},
+        404: {"model": schemas.ErrorResponse, "description": "El estudiante no existe"},
+    },
+)
+def anonimizar_estudiante(
+    student_id: str,
+    db: Session = Depends(get_db),
+    _: Principal = Depends(require_admin),
+):
+    estudiante = db.get(models.Student, student_id)
+    if estudiante is None:
+        raise NotFoundError(f"No existe un estudiante con id {student_id}")
+    if estudiante.anonimizado_en is None:
+        sufijo = student_id.replace("-", "")[:10]
+        estudiante.rut = f"X{sufijo}"                       # único y no válido como RUT
+        estudiante.nombre = "Anonimizado"
+        estudiante.apellido = "Anonimizado"
+        estudiante.email = f"anonimo-{sufijo}@example.com"
+        estudiante.telefono = None
+        estudiante.anonimizado_en = utc_now()
+        for clave in db.execute(
+            select(models.ApiKey).where(models.ApiKey.student_id == student_id,
+                                        models.ApiKey.revoked_at.is_(None))
+        ).scalars():
+            clave.revoked_at = utc_now()
+        db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.get(
     "",
     response_model=schemas.StudentPage,
@@ -93,7 +136,7 @@ def listar_estudiantes(
     db: Session = Depends(get_db),
     _: Principal = Depends(require_admin),
     limit: int = Query(20, ge=1, le=100),
-    offset: int = Query(0, ge=0),
+    offset: int = Query(0, ge=0, le=100_000),
     rut: str | None = Query(None, description="Filtrar por RUT exacto"),
 ):
     stmt = select(models.Student)
@@ -103,7 +146,8 @@ def listar_estudiantes(
         except ValueError:
             pass  # valor inválido: simplemente no coincidirá con ningún estudiante
         stmt = stmt.where(models.Student.rut == rut)
-    total_count = len(db.execute(stmt).all())
+    # COUNT(*) en la base: no se cargan las filas como objetos ORM (antes era O(N) en memoria).
+    total_count = db.execute(select(func.count()).select_from(stmt.order_by(None).subquery())).scalar_one()
     items = (
         db.execute(stmt.order_by(models.Student.created_at.desc()).limit(limit).offset(offset))
         .scalars()
@@ -155,9 +199,19 @@ def emitir_api_key(
     db: Session = Depends(get_db),
     _: Principal = Depends(require_admin),
 ):
-    _estudiante_o_404(db, student_id)
-    clave = generar_api_key()
-    fila = models.ApiKey(student_id=student_id, key_hash=hash_api_key(clave), key_prefix=clave[:8])
+    estudiante = _estudiante_o_404(db, student_id)
+    if estudiante.anonimizado_en is not None:
+        raise ConflictError("El estudiante fue anonimizado: no se le pueden emitir claves.",
+                            code="STUDENT_ANONYMIZED")
+    ahora = utc_now()
+    vigente = _clave_activa(db, student_id)
+    if vigente is not None and vigente.expires_at is not None and vigente.expires_at <= ahora:
+        vigente.revoked_at = ahora      # rotación: la vencida se revoca sola al emitir otra
+        db.flush()
+    clave, prefijo = generar_api_key()
+    vence = ahora + timedelta(days=settings.student_key_ttl_days) if settings.student_key_ttl_days > 0 else None
+    fila = models.ApiKey(student_id=student_id, key_hash=hash_api_key(clave), key_prefix=prefijo,
+                         expires_at=vence)
     db.add(fila)
     try:
         db.commit()
@@ -169,7 +223,8 @@ def emitir_api_key(
         ) from exc
     db.refresh(fila)
     return schemas.ApiKeyIssued(
-        student_id=student_id, key_prefix=fila.key_prefix, created_at=fila.created_at, api_key=clave
+        student_id=student_id, key_prefix=fila.key_prefix, created_at=fila.created_at,
+        expires_at=fila.expires_at, api_key=clave,
     )
 
 
@@ -216,6 +271,6 @@ def revocar_api_key(
     fila = _clave_activa(db, student_id)
     if fila is None:
         raise NotFoundError("El estudiante no tiene una API key activa")
-    fila.revoked_at = datetime.utcnow()
+    fila.revoked_at = utc_now()
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

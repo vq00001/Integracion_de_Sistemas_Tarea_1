@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-from fastapi import FastAPI
+import json
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
 from fastapi.openapi.utils import get_openapi
 
-from .config import settings
+from .config import settings, validar_claves_admin
 from .database import init_db
 from .errors import register_exception_handlers
 from .reconciler import Conciliador
-from .routers import enrollments, health, students
-from .security import advertir_clave_por_defecto
+from .routers import courses, enrollments, health, students
 
 DESCRIPTION = """
 API REST del sistema de **Matrículas** del Centro de Formación Técnica AprendeMás.
@@ -26,7 +29,12 @@ Todos los endpoints de negocio requieren la cabecera `X-API-Key`. Hay dos tipos 
   operar sobre los datos de ese estudiante (su ficha y sus matrículas). Con otra
   persona responde `403`; las matrículas ajenas responden `404`.
 
-Ver la sección "Autenticación" del README.
+Ver la sección "Autenticación" del README. Los intentos de autenticación fallidos se limitan
+por IP (`429` + `Retry-After`) y un estudiante con clave propia tiene un tope de escrituras por minuto.
+
+### Cursos y disponibilidad
+`GET /v1/courses` y `GET /v1/courses/{curso_id}` informan los cupos libres (dato **referencial**,
+con caché de unos segundos). Quien decide si hay cupo es siempre `POST /v1/enrollments`.
 
 ### Errores
 Todas las respuestas de error usan el mismo formato JSON:
@@ -45,9 +53,11 @@ Los endpoints que dependen de Cupos (`POST /v1/enrollments`,
 
 * `504 Gateway Timeout`: Cupos no respondió a tiempo. El resultado es
   **incierto**; la matrícula queda `PENDIENTE` y se concilia (ver más abajo).
-* `503 Service Unavailable`: Cupos caído o circuito abierto (falla rápida).
-  Incluye `Retry-After`.
-* `502 Bad Gateway`: Cupos respondió con un error interno inesperado.
+* `503 Service Unavailable`: Cupos caído o circuito abierto (falla rápida). Si la conexión
+  se rechazó (la solicitud nunca salió) no queda nada pendiente y se puede reintentar con
+  una Idempotency-Key nueva o la misma. Incluye `Retry-After`.
+* `502 Bad Gateway`: Cupos respondió con un error interno inesperado. Por precaución la
+  matrícula también queda `PENDIENTE` y se concilia.
 
 Una matrícula `PENDIENTE` se resuelve reintentando con la misma
 `Idempotency-Key` (dentro de la ventana de reintento) o, si no se reintenta, el
@@ -55,37 +65,63 @@ conciliador la anula y libera el cupo. La lectura de datos ya existentes
 (estudiantes y matrículas) no se ve afectada por una caída de Cupos.
 """
 
+_conciliador: Conciliador | None = None
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global _conciliador
+    # Fail-closed: sin clave admin propia (o con una pública/corta) la API NO arranca.
+    validar_claves_admin(settings.admin_api_keys)
+    init_db()
+    if settings.reconcile_interval_seconds > 0:
+        _conciliador = Conciliador(settings.reconcile_interval_seconds)
+        _conciliador.start()
+    yield
+    if _conciliador is not None:
+        _conciliador.detener()
+
+
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
     description=DESCRIPTION,
     contact={"name": "AprendeMás - Equipo de Integración de Sistemas"},
+    lifespan=lifespan,
+    # En producción DOCS_ENABLED=false: no se publica el contrato ni Swagger sin autenticación.
+    docs_url="/docs" if settings.docs_enabled else None,
+    redoc_url="/redoc" if settings.docs_enabled else None,
+    openapi_url="/openapi.json" if settings.docs_enabled else None,
 )
 
 register_exception_handlers(app)
 
+
+@app.middleware("http")
+async def cabeceras_de_deprecacion(request: Request, call_next):
+    """Política de deprecación hecha código (D3): las rutas listadas en DEPRECATED_ROUTES
+    responden con `Deprecation`, `Sunset` y `Link` para que los consumidores se enteren."""
+    response = await call_next(request)
+    try:
+        rutas = json.loads(settings.deprecated_routes or "{}")
+    except ValueError:
+        logging.getLogger("matriculas").error("DEPRECATED_ROUTES no es JSON válido")
+        return response
+    for prefijo, meta in rutas.items():
+        if request.url.path.startswith(prefijo):
+            response.headers["Deprecation"] = meta.get("deprecation", "true")
+            if meta.get("sunset"):
+                response.headers["Sunset"] = meta["sunset"]
+            if meta.get("link"):
+                response.headers["Link"] = f'<{meta["link"]}>; rel="deprecation"'
+            break
+    return response
+
+
 app.include_router(health.router)
 app.include_router(students.router)
+app.include_router(courses.router)
 app.include_router(enrollments.router)
-
-
-_conciliador: Conciliador | None = None
-
-
-@app.on_event("startup")
-def on_startup() -> None:
-    global _conciliador
-    init_db()
-    advertir_clave_por_defecto()
-    if settings.reconcile_interval_seconds > 0:
-        _conciliador = Conciliador(settings.reconcile_interval_seconds)
-        _conciliador.start()
-
-
-@app.on_event("shutdown")
-def on_shutdown() -> None:
-    if _conciliador is not None:
-        _conciliador.detener()
 
 
 def custom_openapi():

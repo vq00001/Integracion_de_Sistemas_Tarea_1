@@ -1,0 +1,75 @@
+syntax = "proto3";
+
+// Contrato gRPC de Cupos, versión 1.
+//
+// Política de versionado (ver docs/adr/D3-contrato-versionado-y-evolucion.md):
+//  - Cambios compatibles (campo nuevo con número nuevo, valor nuevo de enum,
+//    campo eliminado con su número en `reserved`) se hacen DENTRO de cupo.v1.
+//  - Cambios incompatibles (reutilizar un número de campo, cambiar un tipo,
+//    renombrar o eliminar un RPC) exigen un paquete nuevo (cupo.v2) que
+//    convive con v1 hasta que todos los consumidores migren.
+// El nombre completo del servicio (/cupo.v1.Cupos/...) viaja en cada llamada,
+// por lo que un cliente v1 y un servidor v2 no se confunden entre sí.
+package cupo.v1;
+
+service Cupos {
+
+  rpc obtenerCupo(ObtenerRequest) returns (ObtenerResponse);
+  
+  // devuelve todos los cursos impartidos
+  rpc listarCursos(ListarRequest) returns (ListarCursosResponse);
+  
+  // devuelve solo los cursos con cupos libres
+  rpc listarCursosDisponibles(ListarRequest) returns (ListarCursosResponse);
+
+  rpc ocuparCupo(OcuparRequest) returns (OcuparResponse);
+
+  rpc liberarCupo(LiberarRequest) returns (LiberarResponse);
+}
+
+enum Estado {
+  ESTADO_SIN_DEFINIR = 0;
+  CUPO_OCUPADO = 1;
+  SIN_CUPOS = 2;
+  CUPO_LIBERADO = 3;
+  CURSO_NO_ENCONTRADO = 4;
+}
+
+message ObtenerRequest {
+  int32 curso_id = 1;
+}
+
+message ObtenerResponse {
+  int32 cupos_libres = 1;
+}
+message ListarRequest {}
+
+message Curso {
+  int32 curso_id = 1;
+  string nombre = 2;
+  int32 cupos_totales = 3;
+  int32 cupos_libres = 4;
+}
+
+message ListarCursosResponse {
+  repeated Curso cursos = 1;
+}
+
+message OcuparRequest {
+  int32 curso_id = 1;
+  string idempotency_key = 2;
+}
+
+message OcuparResponse {
+  Estado estado = 1;
+}
+
+message LiberarRequest {
+  int32 curso_id = 1;
+  string idempotency_key = 2;
+}
+
+message LiberarResponse {
+  Estado estado = 1;
+}
+

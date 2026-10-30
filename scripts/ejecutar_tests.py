@@ -12,7 +12,7 @@ Pasos:
   5. Termina con el mismo código de salida de pytest (0 = todo bien).
 
 Uso:
-  python scripts/ejecutar_tests.py                  # suite completa (48 pruebas)
+  python scripts/ejecutar_tests.py                  # suite completa (122 pruebas)
   python scripts/ejecutar_tests.py --rapido         # sin las pruebas que apagan contenedores
   python scripts/ejecutar_tests.py --reset-estado   # además borra contenedores y volúmenes
   python scripts/ejecutar_tests.py -k idempotency   # cualquier otro argumento va a pytest

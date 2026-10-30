@@ -107,17 +107,14 @@ def test_mismo_idempotency_key_simultanea_consume_un_cupo(api, estudiante, cupos
     api.post(f"/v1/enrollments/{ganadora['id']}/revert")
 
 
-def _restablecer_curso(cupos_stub, curso_id: int) -> int:
-    """Deja el curso con todos sus cupos libres y devuelve su capacidad.
+def _cupos_libres_actuales(cupos_stub, curso_id: int) -> int:
+    """Capacidad de partida de la prueba = los cupos libres que tiene el curso ahora.
 
-    Una corrida anterior interrumpida o fallida puede haber dejado cupos retenidos (los
-    volúmenes de Docker persisten entre ejecuciones). Esta prueba necesita un punto de
-    partida conocido, así que libera con claves propias hasta llegar a la capacidad."""
+    Antes la prueba "restablecía" el curso liberando con claves inventadas. Eso ya no es posible
+    (a propósito): Cupos solo libera lo que una clave ocupó, que es justo lo que impide la
+    sobreventa. La prueba parte de lo que haya y exige que no se supere ESA capacidad."""
     pb2, stub = cupos_stub.pb2, cupos_stub.stub
-    curso = next(c for c in stub.listarCursos(pb2.ListarRequest()).cursos if c.curso_id == curso_id)
-    for _ in range(curso.cupos_totales - curso.cupos_libres):
-        stub.liberarCupo(pb2.LiberarRequest(curso_id=curso_id, idempotency_key=f"reset-{uuid.uuid4().hex}"))
-    return curso.cupos_totales
+    return stub.obtenerCupo(pb2.ObtenerRequest(curso_id=curso_id)).cupos_libres
 
 
 def test_concurrencia_estudiantes_distintos_no_sobrepasa_el_cupo(api, cupos_stub):
@@ -125,7 +122,7 @@ def test_concurrencia_estudiantes_distintos_no_sobrepasa_el_cupo(api, cupos_stub
     matrícula tantos como cupos tiene el curso, el resto recibe 409."""
     from tests.conftest import CURSO_CAPACIDAD_BAJA, rut_valido
     pb2, stub = cupos_stub.pb2, cupos_stub.stub
-    capacidad = _restablecer_curso(cupos_stub, CURSO_CAPACIDAD_BAJA)
+    capacidad = _cupos_libres_actuales(cupos_stub, CURSO_CAPACIDAD_BAJA)
     assert capacidad >= 1
     libres = lambda: stub.obtenerCupo(pb2.ObtenerRequest(curso_id=CURSO_CAPACIDAD_BAJA)).cupos_libres
 
