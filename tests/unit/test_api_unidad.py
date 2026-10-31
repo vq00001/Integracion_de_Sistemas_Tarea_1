@@ -33,8 +33,9 @@ def m():
     if not (api_dir / "app" / "grpc_stubs" / "cupos_pb2.py").exists():
         subprocess.run([sys.executable, str(api_dir / "generar_stubs.py")], check=True, capture_output=True)
     tmp = Path(tempfile.mkdtemp(prefix="mat_unit_"))
-    previo = {k: os.environ.get(k) for k in ("API_KEYS", "DATABASE_URL", "RECONCILE_INTERVAL_SECONDS")}
-    os.environ.update(API_KEYS=ADMIN, DATABASE_URL=f"sqlite:///{tmp / 'm.db'}", RECONCILE_INTERVAL_SECONDS="0")
+    previo = {k: os.environ.get(k) for k in ("API_KEYS", "JWT_SECRET", "DATABASE_URL", "RECONCILE_INTERVAL_SECONDS")}
+    os.environ.update(API_KEYS=ADMIN, JWT_SECRET=secrets.token_urlsafe(32),
+                      DATABASE_URL=f"sqlite:///{tmp / 'm.db'}", RECONCILE_INTERVAL_SECONDS="0")
     sys.path.insert(0, str(api_dir))
     for nombre in [n for n in sys.modules if n == "app" or n.startswith("app.")]:
         sys.modules.pop(nombre)

@@ -25,10 +25,29 @@ def main() -> int:
 
     destino, plantilla = ROOT / ".env", ROOT / ".env.example"
     if destino.exists() and not args.forzar:
-        print(".env ya existe: no se modifica (usa --forzar para regenerarlo).")
+        contenido = destino.read_text(encoding="utf-8")
+        # Al agregar variables nuevas de autenticación, completa instalaciones existentes sin
+        # rotar API_KEYS ni la contraseña de PostgreSQL que ya está en uso.
+        faltantes = {}
+        if not any(linea.startswith("MATRICULAS_JWT_SECRET=") for linea in contenido.splitlines()):
+            faltantes["MATRICULAS_JWT_SECRET"] = secrets.token_urlsafe(48)
+        if faltantes:
+            with destino.open("a", encoding="utf-8") as archivo:
+                if contenido and not contenido.endswith("\n"):
+                    archivo.write("\n")
+                for nombre, valor in faltantes.items():
+                    archivo.write(f"{nombre}={valor}\n")
+            try:
+                destino.chmod(0o600)
+            except OSError:
+                pass
+            print(".env existente: se agregaron variables nuevas sin cambiar las credenciales guardadas.")
+        else:
+            print(".env ya existe: no se modifica (usa --forzar para regenerarlo).")
         return 0
     valores = {
         "MATRICULAS_API_KEYS": secrets.token_urlsafe(32),
+        "MATRICULAS_JWT_SECRET": secrets.token_urlsafe(48),
         "MATRICULAS_DB_PASSWORD": secrets.token_urlsafe(24),
     }
     lineas = []

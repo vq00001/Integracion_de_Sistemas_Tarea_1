@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.openapi.utils import get_openapi
 
-from .config import settings, validar_claves_admin
+from .config import settings, validar_claves_admin, validar_secreto_jwt
 from .database import init_db
 from .errors import register_exception_handlers
 from .reconciler import Conciliador
@@ -21,11 +21,12 @@ matrícula, valida en tiempo real la disponibilidad de cupos consultando
 al servicio **Cupos** a través de gRPC (contrato: `proto/cupos.proto`).
 
 ### Autenticación
-Todos los endpoints de negocio requieren la cabecera `X-API-Key`. Hay dos tipos de clave:
+Los endpoints de negocio aceptan `X-API-Key` (integraciones existentes) o un JWT local
+`Authorization: Bearer ...` (usuarios). Ambos aplican autorización por propietario:
 
 * **Administrador** (variable `API_KEYS`): acceso total. Es la única que puede crear y
   listar estudiantes y emitir o revocar claves de estudiante.
-* **Estudiante** (emitida a demanda con `POST /v1/students/{id}/api-key`): solo permite
+* **Estudiante** (API key emitida o token JWT): solo permite
   operar sobre los datos de ese estudiante (su ficha y sus matrículas). Con otra
   persona responde `403`; las matrículas ajenas responden `404`.
 
@@ -73,6 +74,7 @@ async def lifespan(_: FastAPI):
     global _conciliador
     # Fail-closed: sin clave admin propia (o con una pública/corta) la API NO arranca.
     validar_claves_admin(settings.admin_api_keys)
+    validar_secreto_jwt(settings.jwt_secret)
     init_db()
     if settings.reconcile_interval_seconds > 0:
         _conciliador = Conciliador(settings.reconcile_interval_seconds)
@@ -118,7 +120,10 @@ async def cabeceras_de_deprecacion(request: Request, call_next):
     return response
 
 
+from .routers import auth  # noqa: E402
+
 app.include_router(health.router)
+app.include_router(auth.router)
 app.include_router(students.router)
 app.include_router(courses.router)
 app.include_router(enrollments.router)
@@ -138,11 +143,16 @@ def custom_openapi():
         "in": "header",
         "name": "X-API-Key",
     }
+    schema.setdefault("components", {}).setdefault("securitySchemes", {})["BearerAuth"] = {
+        "type": "http", "scheme": "bearer", "bearerFormat": "JWT"
+    }
     for path in schema.get("paths", {}).values():
         for operation in path.values():
             if operation.get("tags") in (["Salud"],):
                 continue
-            operation.setdefault("security", [{"ApiKeyAuth": []}])
+            if operation.get("tags") == ["Autenticación"]:
+                continue
+            operation["security"] = [{"ApiKeyAuth": []}, {"BearerAuth": []}]
     app.openapi_schema = schema
     return schema
 

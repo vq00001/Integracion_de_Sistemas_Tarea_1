@@ -99,6 +99,18 @@ class ApiKeyIssued(ApiKeyInfo):
     )
 
 
+class StudentPasswordSet(BaseModel):
+    """Contraseña inicial o reiniciada por un administrador; nunca se devuelve."""
+
+    password: str = Field(..., min_length=12, max_length=128)
+
+
+class AccessToken(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+
+
 # ---------------------------------------------------------------------------
 # Matrículas
 # ---------------------------------------------------------------------------

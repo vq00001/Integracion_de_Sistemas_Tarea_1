@@ -16,6 +16,7 @@ from ..security import (
     Principal,
     exigir_acceso_a_estudiante,
     generar_api_key,
+    hash_password,
     hash_api_key,
     require_admin,
     require_api_key,
@@ -119,7 +120,35 @@ def anonimizar_estudiante(
                                         models.ApiKey.revoked_at.is_(None))
         ).scalars():
             clave.revoked_at = utc_now()
+        # Revoca también el acceso OAuth2/JWT de forma inmediata.
+        db.execute(models.StudentCredential.__table__.delete().where(
+            models.StudentCredential.student_id == student_id
+        ))
         db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.put(
+    "/{student_id}/password",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Definir o reiniciar contraseña local (solo administrador)",
+    description="La contraseña se guarda como PBKDF2-SHA256 y permite obtener un JWT en /v1/auth/token.",
+)
+def establecer_password(
+    student_id: str,
+    payload: schemas.StudentPasswordSet,
+    db: Session = Depends(get_db),
+    _: Principal = Depends(require_admin),
+):
+    _estudiante_o_404(db, student_id)
+    credential = db.get(models.StudentCredential, student_id)
+    if credential is None:
+        credential = models.StudentCredential(student_id=student_id,
+                                              password_hash=hash_password(payload.password))
+        db.add(credential)
+    else:
+        credential.password_hash = hash_password(payload.password)
+    db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

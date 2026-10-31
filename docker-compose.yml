@@ -82,6 +82,8 @@ services:
       # SIN valor por defecto: si falta, `docker compose` se niega a levantar; y si es una clave
       # publica/corta, la API se niega a arrancar. Genera .env con: python scripts/generar_env.py
       API_KEYS: ${MATRICULAS_API_KEYS:?Falta MATRICULAS_API_KEYS - ejecuta `python scripts/generar_env.py`}
+      JWT_SECRET: ${MATRICULAS_JWT_SECRET:?Falta MATRICULAS_JWT_SECRET - ejecuta `python scripts/generar_env.py`}
+      JWT_TTL_MINUTES: ${MATRICULAS_JWT_TTL_MINUTES:-60}
       STUDENT_KEY_TTL_DAYS: ${STUDENT_KEY_TTL_DAYS:-90}
       AUTH_FAIL_LIMIT: ${AUTH_FAIL_LIMIT:-20}
       AUTH_FAIL_WINDOW_SECONDS: ${AUTH_FAIL_WINDOW_SECONDS:-60}

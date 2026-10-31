@@ -70,7 +70,7 @@ Cada sistema es dueño de sus datos: Cupos utiliza SQLite en el volumen `cupos_d
 
 Matrículas no mantiene una tabla local de cursos. La API integrada almacena el `curso_id` correspondiente a Cupos y verifica la existencia y disponibilidad del curso por gRPC. En cambio, el CLI legado registra un `codigo_curso` de texto libre, sin validación de disponibilidad.
 
-La API incluye autenticación mediante API Key, errores JSON uniformes, cliente gRPC con circuit breaker, conciliación de matrículas en estado `PENDIENTE`, validación de RUT y caché de disponibilidad con TTL corto. Los contratos se encuentran en `proto/cupos.proto` y `matriculas-api/docs/openapi.{json,yaml}`; las decisiones arquitectónicas se documentan en `docs/adr/`.
+La API conserva las API keys para integraciones máquina a máquina y añade autenticación local OAuth2/JWT para usuarios, con permisos acotados al estudiante autenticado. También incluye errores JSON uniformes, cliente gRPC con circuit breaker, conciliación de matrículas `PENDIENTE`, validación de RUT y caché de disponibilidad con TTL corto. Los contratos se encuentran en `proto/cupos.proto` y `matriculas-api/docs/openapi.{json,yaml}`; las decisiones arquitectónicas se documentan en `docs/adr/`.
 
 ## Instalación y ejecución
 

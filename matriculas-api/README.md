@@ -136,26 +136,45 @@ Códigos usados: `VALIDATION_ERROR`, `UNAUTHORIZED`, `NOT_FOUND`,
 `CUPOS_RESPUESTA_INVALIDA` (502), `PERSISTENCE_ERROR`, `INTERNAL_ERROR`.
 (`FORBIDDEN` ya no se usa: ver `docs/adr/D5-autenticacion-api-key.md`.)
 
-## Autenticación y permisos: API Key
+## Autenticación y permisos: API Key + OAuth2/JWT local
 
-Se eligió **API Key** (header `X-API-Key`) en vez de OAuth2/JWT o Basic Auth
-(razones en `app/security.py` y `docs/adr/D5-autenticacion-api-key.md`): el modelo
-es máquina-a-máquina, la verificación es barata y las credenciales se emiten y
-revocan por cliente sin un servidor de autorización.
+La API acepta en paralelo las API keys existentes (`X-API-Key`) y tokens de usuario
+(`Authorization: Bearer <JWT>`). Las API keys conservan su comportamiento para integraciones
+maquina a maquina. El flujo JWT se valida y firma dentro de esta API, sin servicios externos.
 
-Hay **dos tipos de clave**, ambas en `X-API-Key`:
-
-| | Admin | Estudiante |
+| Credencial | Emisión/almacenamiento | Alcance |
 |---|---|---|
-| Origen | Variable de entorno `API_KEYS` (coma-separada), **obligatoria, ≥ 24 caracteres y no pública** | Emitida a demanda: `POST /v1/students/{id}/api-key` (solo admin) |
-| Almacenamiento | Entorno (texto plano) | Tabla `api_keys`, **solo el hash SHA-256**; el valor se muestra una única vez |
-| Cantidad | Las que se configuren | **Una activa por estudiante** (índice único parcial) |
-| Vigencia | Hasta que se rote la variable | `STUDENT_KEY_TTL_DAYS` (90); una vencida da `401` y se revoca sola al emitir otra |
-| Alcance | Todo | Solo los datos de ese estudiante |
+| API key admin | Variable `API_KEYS` (`MATRICULAS_API_KEYS` en `.env`), obligatoria, ≥24 caracteres | Acceso administrativo total |
+| API key estudiante | `POST /v1/students/{id}/api-key`; se almacena solo hash SHA-256 | Recursos propios del estudiante |
+| JWT estudiante | OAuth2 password local; contraseña configurada por admin y hash PBKDF2 en `student_credentials` | Recursos propios; token firmado HS256 con expiración |
+
+El administrador puede establecer o reiniciar una contraseña con `PUT /v1/students/{id}/password`
+(JSON `{"password":"..."}`, mínimo 12 caracteres). El correo del estudiante es el `username`.
+La contraseña no se devuelve y se almacena con PBKDF2-SHA256 y sal aleatoria. Eliminar el acceso
+OAuth2 (incluido anonimizar el estudiante) borra la credencial y hace que sus JWT dejen de servir.
+La base nueva `student_credentials` se crea al iniciar; las instalaciones existentes reciben la
+tabla sin alterar `students` ni requerir una migración destructiva.
+
+**Inicio de sesión** (`application/x-www-form-urlencoded`):
+
+```bash
+curl -X PUT localhost:8000/v1/students/<id>/password \
+  -H "X-API-Key: $ADMIN_KEY" -H 'Content-Type: application/json' \
+  -d '{"password":"ClaveSeguraLocal-123"}'
+curl -X POST localhost:8000/v1/auth/token \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'username=ana@example.com&password=ClaveSeguraLocal-123'
+# usar access_token en Authorization: Bearer <access_token>
+```
+
+`MATRICULAS_JWT_SECRET` debe ser aleatorio y tener al menos 32 caracteres. `python
+scripts/generar_env.py` lo genera junto con la clave admin; `MATRICULAS_JWT_TTL_MINUTES`
+define la vigencia (60 por defecto). Un token incluye `sub` (id del estudiante), emisor,
+audiencia y expiración. La API verifica la firma HMAC-SHA256 y que la cuenta siga activa.
 
 **Qué puede hacer cada una**
 
-| Operación | Admin | Estudiante (su clave) |
+| Operación | Admin | Estudiante (API key personal o JWT) |
 |---|---|---|
 | `POST /v1/students`, `GET /v1/students` (listar) | ✅ | ❌ 403 |
 | `GET /v1/students/{id}` | ✅ cualquiera | ✅ solo el suyo (403 si es otro) |
@@ -184,7 +203,7 @@ curl -X POST localhost:8000/v1/enrollments -H "X-API-Key: mat_..." \
 curl -X DELETE localhost:8000/v1/students/<id>/api-key -H "X-API-Key: $ADMIN_KEY"
 ```
 
-**Sin clave admin por defecto (fail-closed).** La API **no arranca** si `API_KEYS` falta, es un valor
+**Sin secretos por defecto (fail-closed).** La API **no arranca** si `API_KEYS` falta, es un valor
 público conocido (incluido el `dev-matriculas-key-123` que traían versiones anteriores del repositorio) o mide
 menos de 24 caracteres. Genera una con `python scripts/generar_env.py` o
 `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
@@ -200,9 +219,10 @@ aleatorios): se puede mostrar en listados y logs sin revelar nada del secreto.
 proxy TLS delante (D5). **Privacidad:** `DELETE /v1/students/{id}` anonimiza los datos personales de un
 estudiante conservando sus matrículas como historial.
 
-Implementación: `app/security.py` (`require_api_key` devuelve un `Principal`;
-`require_admin` y `exigir_acceso_a_estudiante` aplican los permisos) y la tabla
-`api_keys` (`app/models.py`, se crea sola con `create_all`: no requiere migración).
+Implementación: `app/routers/auth.py` emite los tokens; `app/security.py` valida API key o JWT
+y crea el mismo `Principal` para ambos. `require_admin`, `exigir_acceso_a_estudiante` y las rutas
+de matrículas aplican las reglas de propietario existentes. Las tablas `api_keys` y
+`student_credentials` se crean con `create_all`.
 
 ## Manejo de fallas del gRPC de Cupos
 

@@ -62,6 +62,7 @@ class Api:
 
     def get(self, path, **kw): return self.request("GET", path, **kw)
     def post(self, path, **kw): return self.request("POST", path, **kw)
+    def put(self, path, **kw): return self.request("PUT", path, **kw)
     def delete(self, path, **kw): return self.request("DELETE", path, **kw)
 
 

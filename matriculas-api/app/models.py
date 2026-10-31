@@ -54,6 +54,25 @@ class Student(Base):
     api_keys: Mapped[list["ApiKey"]] = relationship(
         back_populates="estudiante", cascade="all, delete-orphan"
     )
+    credential: Mapped["StudentCredential | None"] = relationship(
+        back_populates="estudiante", cascade="all, delete-orphan", uselist=False
+    )
+
+
+class StudentCredential(Base):
+    """Credencial local para el inicio de sesión OAuth2 de un estudiante.
+
+    La contraseña nunca se almacena en claro; password_hash contiene PBKDF2-SHA256.
+    Separarla de `students` permite añadir autenticación sin alterar la tabla existente.
+    """
+
+    __tablename__ = "student_credentials"
+
+    student_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("students.id", ondelete="CASCADE"), primary_key=True
+    )
+    password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
+    estudiante: Mapped[Student] = relationship(back_populates="credential")
 
 
 class Enrollment(Base):

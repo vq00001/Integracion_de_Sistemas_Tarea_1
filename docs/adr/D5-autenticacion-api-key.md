@@ -41,9 +41,22 @@ Se guarda el hash y no el valor porque la clave es un token aleatorio de 256 bit
 - La clave de estudiante no se puede recuperar: si se pierde, el admin la revoca y emite otra.
 - **Sin TLS** (ver la sección siguiente).
 
+## Evolución implementada: identidad local OAuth2/JWT
+
+El requisito de identidad de usuario se incorporó posteriormente sin retirar las API keys.
+La API ofrece ahora POST /v1/auth/token con el flujo password OAuth2 local; el email es el
+nombre de usuario y el administrador establece la contraseña mediante
+PUT /v1/students/{id}/password. Se guarda PBKDF2-SHA256 con sal en una tabla separada y se
+emiten JWT HS256 firmados con MATRICULAS_JWT_SECRET. La firma, emisor, audiencia, expiración
+y vigencia de la cuenta se comprueban localmente.
+
+Las rutas de negocio aceptan ambos esquemas. El JWT identifica al estudiante por sub; las
+validaciones de propietario existentes siguen acotando lecturas, creación y reversión de
+matrículas. Las API keys mantienen su flujo de administración e integración.
+
 ## Consecuencias
 
-Si aparece un portal con usuarios finales, se agrega `Authorization: Bearer <JWT>` junto a `X-API-Key` sin romper a los clientes existentes. Para producción, las claves admin también deberían vivir como hash en una tabla con rotación, y publicarse detrás de TLS.
+El inicio y firma de JWT se ejecutan dentro de la API, sin proveedor externo ni servidor de autorización. Para producción, las claves admin también deberían vivir como hash en una tabla con rotación, y publicarse detrás de TLS.
 
 ## Transporte: lo que NO está resuelto y por qué se acepta
 - **La API habla HTTP en claro.** Una clave (y datos personales) viajan sin cifrar si se expone en una red no confiable. No se incluyó un proxy TLS porque no se pudo verificar en el entorno de desarrollo y una configuración de TLS no probada es peor que declararla ausente. **Mitigación aplicada:** el puerto 8000 se publica solo en `127.0.0.1` por defecto (`API_BIND`); exponerlo en una red exige `API_BIND=0.0.0.0` **y** poner delante un proxy inverso con TLS (nginx, Caddy o el balanceador), que además debe fijar la IP real del cliente para el límite de intentos. Es un **costo aceptado para el entorno de la entrega**, no una solución para producción.
