@@ -10,12 +10,42 @@ import requests
 
 ROOT = Path(__file__).resolve().parent.parent
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
-API_KEY = os.getenv("API_KEY", os.getenv("MATRICULAS_API_KEYS", "dev-matriculas-key-123").split(",")[0].strip())
+
+
+def _clave_admin() -> str:
+    """Clave admin de las pruebas. NO hay valor por defecto (la API se niega a arrancar sin
+    clave propia): se toma de API_KEY / MATRICULAS_API_KEYS o del .env que genera
+    `python scripts/generar_env.py`."""
+    for nombre in ("API_KEY", "MATRICULAS_API_KEYS"):
+        valor = os.getenv(nombre, "").split(",")[0].strip()
+        if valor:
+            return valor
+    env = ROOT / ".env"
+    if env.exists():
+        for linea in env.read_text(encoding="utf-8").splitlines():
+            if linea.startswith("MATRICULAS_API_KEYS="):
+                return linea.split("=", 1)[1].split(",")[0].strip()
+    pytest.exit("Falta la clave admin: ejecuta `python scripts/generar_env.py` o define API_KEY.", returncode=2)
+
+
+API_KEY = _clave_admin()
 CURSO_CON_CUPO = int(os.getenv("CURSO_CON_CUPO", "1"))
 CURSO_CAPACIDAD_BAJA = int(os.getenv("CURSO_CAPACIDAD_BAJA", "5"))
 CURSO_LLENO = CURSO_CAPACIDAD_BAJA
 CUPOS_GRPC_ADDR = os.getenv("CUPOS_GRPC_ADDR", "localhost:50051")
 COMPOSE_ARGS = os.getenv("COMPOSE_ARGS", "-f docker-compose.yml -f docker-compose.test.yml").split()
+
+
+def rut_valido(semilla: int | None = None) -> str:
+    """RUT chileno con dígito verificador correcto (la API valida el módulo 11)."""
+    cuerpo = str(semilla if semilla is not None else 10_000_000 + uuid.uuid4().int % 80_000_000)
+    suma, factor = 0, 2
+    for d in reversed(cuerpo):
+        suma += int(d) * factor
+        factor = 2 if factor == 7 else factor + 1
+    resto = 11 - suma % 11
+    dv = "0" if resto == 11 else "K" if resto == 10 else str(resto)
+    return f"{cuerpo}-{dv}"
 
 
 class Api:
@@ -32,6 +62,7 @@ class Api:
 
     def get(self, path, **kw): return self.request("GET", path, **kw)
     def post(self, path, **kw): return self.request("POST", path, **kw)
+    def put(self, path, **kw): return self.request("PUT", path, **kw)
     def delete(self, path, **kw): return self.request("DELETE", path, **kw)
 
 
@@ -50,7 +81,7 @@ def estudiante(api) -> dict:
     """Estudiante nuevo y único por prueba (evita colisiones entre tests)."""
     sufijo = uuid.uuid4().hex[:8]
     payload = {
-        "rut": f"{sufijo[:8]}-{sufijo[-1]}",
+        "rut": rut_valido(),
         "nombre": f"Test {sufijo[:4]}",
         "apellido": "Api",
         "email": f"t{sufijo}@example.com",
@@ -99,9 +130,27 @@ def curso_lleno(cupos_stub):
         claves.append(clave)
     yield CURSO_CAPACIDAD_BAJA
     for clave in claves:
-        stub.liberarCupo(pb2.LiberarRequest(curso_id=CURSO_CAPACIDAD_BAJA, idempotency_key=f"teardown-{clave}"))
+        # Cupos solo libera lo que ESA clave ocupó: se libera con la misma clave de la ocupación.
+        stub.liberarCupo(pb2.LiberarRequest(curso_id=CURSO_CAPACIDAD_BAJA, idempotency_key=clave))
 
 
-def compose(*args: str) -> subprocess.CompletedProcess:
+def compose(*args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+    """Ejecuta `docker compose`. `env` agrega variables que compose sustituye en
+    docker-compose.yml (p. ej. SIMULAR_LATENCIA_MS)."""
     return subprocess.run(["docker", "compose", *COMPOSE_ARGS, *args], cwd=ROOT,
-                          check=True, capture_output=True, text=True)
+                          check=True, capture_output=True, text=True,
+                          env={**os.environ, **(env or {})})
+
+
+def esperar_api(api, segundos: float = 40) -> None:
+    """Espera a que la API responda tras reiniciarla."""
+    import time
+    limite = time.monotonic() + segundos
+    while time.monotonic() < limite:
+        try:
+            if requests.get(f"{api.base_url}/v1/health", timeout=2).status_code == 200:
+                return
+        except requests.RequestException:
+            pass
+        time.sleep(0.5)
+    raise RuntimeError("la API no volvió a responder")

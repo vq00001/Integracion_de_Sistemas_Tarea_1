@@ -1,0 +1,6 @@
+                     timeouts_504      huerfanos_tras_timeout      pendientes_tras_timeout      huerfanos_final      pendientes_final      segundos_hasta_resolver     
+                             mean  std                   mean  std                    mean  std            mean  std             mean  std                    mean  std
+modo               n                                                                                                                                                   
+con_conciliador    8          8.0  0.0                    8.0  0.0                     8.0  0.0             0.0  0.0              0.0  0.0                    35.6  0.6
+deadline_en_origen 8          8.0  0.0                    0.0  0.0                     8.0  0.0             0.0  0.0              8.0  0.0                    55.4  0.3
+sin_conciliador    8          8.0  0.0                    8.0  0.0                     8.0  0.0             8.0  0.0              8.0  0.0                    55.4  0.2

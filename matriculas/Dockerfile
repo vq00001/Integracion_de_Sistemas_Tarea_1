@@ -8,7 +8,8 @@ FROM node:20-alpine
 WORKDIR /usr/src/app
 
 COPY matriculas/package*.json ./
-RUN npm install --omit=dev
+# `npm ci` instala EXACTAMENTE lo fijado en package-lock.json (build reproducible)
+RUN npm ci --omit=dev
 
 COPY matriculas/ .
 

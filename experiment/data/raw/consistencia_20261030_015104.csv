@@ -1,0 +1,10 @@
+label,rep,modo,latencia_modo,conciliador_s,ttl_s,timeout_s,cb_threshold,n,concurrencia,timeouts_504,huerfanos_tras_timeout,pendientes_tras_timeout,pendientes_final,segundos_hasta_resolver,huerfanos_final
+consistencia,1,sin_conciliador,despues,0,30,2.0,1000,8,4,8,8,8,8,55.4,8
+consistencia,1,con_conciliador,despues,10,30,2.0,1000,8,4,8,8,8,0,36.2,0
+consistencia,1,deadline_en_origen,antes,0,30,2.0,1000,8,4,8,0,8,8,55.4,0
+consistencia,2,sin_conciliador,despues,0,30,2.0,1000,8,4,8,8,8,8,55.2,8
+consistencia,2,con_conciliador,despues,10,30,2.0,1000,8,4,8,8,8,0,35.0,0
+consistencia,2,deadline_en_origen,antes,0,30,2.0,1000,8,4,8,0,8,8,55.1,0
+consistencia,3,sin_conciliador,despues,0,30,2.0,1000,8,4,8,8,8,8,55.6,8
+consistencia,3,con_conciliador,despues,10,30,2.0,1000,8,4,8,8,8,0,35.5,0
+consistencia,3,deadline_en_origen,antes,0,30,2.0,1000,8,4,8,0,8,8,55.7,0

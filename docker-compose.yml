@@ -1,17 +1,31 @@
+# Nombre fijo del proyecto: los contenedores 'tests' y 'experimentos' controlan los demás
+# servicios con `docker compose`, y necesitan apuntar exactamente al mismo proyecto.
+name: integracion-sistemas-t1
+
 services:
   cupos:
     build:
       context: .                    # raíz del servicio cupos
       dockerfile: cupos/Dockerfile
+    restart: unless-stopped         # si Cupos cae por un error, vuelve solo (antes no tenia restart)
     environment:
       DB_PATH: /data/cupos.db
-      SIMULAR_LATENCIA_MS: ${SIMULAR_LATENCIA_MS:-0}  # latencia artificial para pruebas
+      SIMULAR_LATENCIA_MS: ${SIMULAR_LATENCIA_MS:-0}  # latencia artificial para pruebas/experimentos
+      SIMULAR_LATENCIA_MODO: ${SIMULAR_LATENCIA_MODO:-antes}   # antes | despues (ver experiment/README.md)
+      IDEMPOTENCIA_RETENCION_DIAS: ${IDEMPOTENCIA_RETENCION_DIAS:-30}
     volumes:
       - cupos_data:/data            # BD propia del servicio (T5)
     expose:
-      - "50051"                     # no publicar al exterior
-    ports:
-      - "50051:50051"               # para pruebas locales
+      - "50051"                     # solo visible para otros servicios del compose (red interna)
+    # Sin `ports:` a propósito: el gRPC de Cupos es interno y no se publica en el host.
+    # Para las pruebas de contrato se publica solo en 127.0.0.1 (docker-compose.test.yml).
+    healthcheck:
+      # El canal gRPC debe poder conectarse; así la API solo arranca cuando Cupos está listo.
+      test: ["CMD", "python", "-c", "import grpc; ch = grpc.insecure_channel('localhost:50051'); grpc.channel_ready_future(ch).result(timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
 
   matriculas-db:
     image: postgres:16-alpine
@@ -19,13 +33,13 @@ services:
     environment:
       POSTGRES_DB: ${MATRICULAS_DB_NAME:-matriculas_db}
       POSTGRES_USER: ${MATRICULAS_DB_USER:-matriculas_user}
-      POSTGRES_PASSWORD: ${MATRICULAS_DB_PASSWORD:-matriculas_pass}
+      POSTGRES_PASSWORD: ${MATRICULAS_DB_PASSWORD:?Falta MATRICULAS_DB_PASSWORD - ejecuta `python scripts/generar_env.py`}
     volumes:
       - matriculas_db_data:/var/lib/postgresql/data   # BD propia del servicio (T5), igual que cupos_data
     expose:
       - "5432"                      # solo visible para otros servicios del compose
-    ports:
-      - "5432:5432"                 # para pruebas locales (psql, etc.) - quitar en un despliegue real
+    # Sin `ports:`: la base contiene datos personales y no debe ser accesible desde fuera del
+    # compose. Para inspeccionarla: docker compose exec matriculas-db psql -U matriculas_user -d matriculas_db
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${MATRICULAS_DB_USER:-matriculas_user} -d ${MATRICULAS_DB_NAME:-matriculas_db}"]
       interval: 5s
@@ -44,7 +58,7 @@ services:
       DB_PORT: 5432
       DB_NAME: ${MATRICULAS_DB_NAME:-matriculas_db}
       DB_USER: ${MATRICULAS_DB_USER:-matriculas_user}
-      DB_PASSWORD: ${MATRICULAS_DB_PASSWORD:-matriculas_pass}
+      DB_PASSWORD: ${MATRICULAS_DB_PASSWORD:?Falta MATRICULAS_DB_PASSWORD}
     depends_on:
       matriculas-db:
         condition: service_healthy
@@ -58,19 +72,88 @@ services:
       dockerfile: matriculas-api/Dockerfile
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgresql+psycopg2://${MATRICULAS_DB_USER:-matriculas_user}:${MATRICULAS_DB_PASSWORD:-matriculas_pass}@matriculas-db:5432/${MATRICULAS_DB_NAME:-matriculas_db}
+      DATABASE_URL: postgresql+psycopg2://${MATRICULAS_DB_USER:-matriculas_user}:${MATRICULAS_DB_PASSWORD:?Falta MATRICULAS_DB_PASSWORD}@matriculas-db:5432/${MATRICULAS_DB_NAME:-matriculas_db}
       CUPOS_GRPC_TARGET: cupos:50051
       CUPOS_GRPC_TIMEOUT_SECONDS: ${CUPOS_GRPC_TIMEOUT_SECONDS:-2.0}
       CUPOS_CB_FAILURE_THRESHOLD: ${CUPOS_CB_FAILURE_THRESHOLD:-5}
       CUPOS_CB_RECOVERY_SECONDS: ${CUPOS_CB_RECOVERY_SECONDS:-15.0}
-      API_KEYS: ${MATRICULAS_API_KEYS:-dev-matriculas-key-123}
+      PENDING_TTL_SECONDS: ${PENDING_TTL_SECONDS:-30}
+      RECONCILE_INTERVAL_SECONDS: ${RECONCILE_INTERVAL_SECONDS:-10}
+      # SIN valor por defecto: si falta, `docker compose` se niega a levantar; y si es una clave
+      # publica/corta, la API se niega a arrancar. Genera .env con: python scripts/generar_env.py
+      API_KEYS: ${MATRICULAS_API_KEYS:?Falta MATRICULAS_API_KEYS - ejecuta `python scripts/generar_env.py`}
+      JWT_SECRET: ${MATRICULAS_JWT_SECRET:?Falta MATRICULAS_JWT_SECRET - ejecuta `python scripts/generar_env.py`}
+      JWT_TTL_MINUTES: ${MATRICULAS_JWT_TTL_MINUTES:-60}
+      STUDENT_KEY_TTL_DAYS: ${STUDENT_KEY_TTL_DAYS:-90}
+      AUTH_FAIL_LIMIT: ${AUTH_FAIL_LIMIT:-20}
+      AUTH_FAIL_WINDOW_SECONDS: ${AUTH_FAIL_WINDOW_SECONDS:-60}
+      WRITE_RATE_LIMIT_PER_MINUTE: ${WRITE_RATE_LIMIT_PER_MINUTE:-60}
+      CURSOS_CACHE_TTL_SECONDS: ${CURSOS_CACHE_TTL_SECONDS:-5}
+      DOCS_ENABLED: ${DOCS_ENABLED:-true}      # false en produccion: no publicar /docs ni /openapi.json
     ports:
-      - "8000:8000"                 # API pública
+      # API publica: el unico puerto publicado del sistema. Por defecto SOLO en loopback: la API
+      # habla HTTP en claro (sin TLS). Para exponerla en una red, pon un proxy TLS delante (D5) y
+      # recien entonces API_BIND=0.0.0.0.
+      - "${API_BIND:-127.0.0.1}:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/v1/health', timeout=3).status == 200 else 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
     depends_on:
       matriculas-db:
         condition: service_healthy
       cupos:
-        condition: service_started
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Ejecutores automáticos (no se levantan con `docker compose up`; solo con `run`)
+  # ---------------------------------------------------------------------------
+  # Pruebas:        docker compose run --rm --build tests [--rapido] [--reset-estado]
+  # Experimentos:   docker compose run --rm --build experimentos [--reps 3] [--rapido]
+  tests:
+    profiles: ["tests"]
+    build:
+      context: .
+      dockerfile: runner/Dockerfile
+    working_dir: /repo
+    entrypoint: ["python", "scripts/ejecutar_tests.py"]
+    environment:
+      COMPOSE_ARGS: "-f docker-compose.yml"      # sin el override que publica puertos en el host
+      MATRICULAS_API_KEYS: ${MATRICULAS_API_KEYS:?Falta MATRICULAS_API_KEYS}
+      # 0 por defecto: borrar volumenes ELIMINA los datos del sistema. Solo con --reset-estado
+      # (o RESET_ESTADO=1) y unicamente en una maquina donde no haya datos que conservar.
+      RESET_ESTADO: ${RESET_ESTADO:-0}
+    volumes:
+      - .:/repo
+      # ATENCION: el socket de Docker equivale a root en el anfitrion. Solo se monta en estos
+      # ejecutores (profiles `tests` y `experimentos`, que nunca arrancan con `docker compose up`)
+      # porque las pruebas de falla y los experimentos apagan/recrean contenedores.
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      matriculas-api:
+        condition: service_healthy
+
+  experimentos:
+    profiles: ["experimentos"]
+    build:
+      context: .
+      dockerfile: runner/Dockerfile
+    working_dir: /repo
+    entrypoint: ["python", "experiment/ejecutar_todo.py"]
+    environment:
+      COMPOSE_ARGS: ""
+      API_KEY: ${MATRICULAS_API_KEYS:?Falta MATRICULAS_API_KEYS}
+    volumes:
+      - .:/repo
+      # ATENCION: el socket de Docker equivale a root en el anfitrion. Solo se monta en estos
+      # ejecutores (profiles `tests` y `experimentos`, que nunca arrancan con `docker compose up`)
+      # porque las pruebas de falla y los experimentos apagan/recrean contenedores.
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      matriculas-api:
+        condition: service_healthy
 
 volumes:
   cupos_data:

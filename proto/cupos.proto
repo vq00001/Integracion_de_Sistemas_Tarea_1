@@ -1,6 +1,16 @@
 syntax = "proto3";
 
-package cupo;
+// Contrato gRPC de Cupos, versión 1.
+//
+// Política de versionado (ver docs/adr/D3-contrato-versionado-y-evolucion.md):
+//  - Cambios compatibles (campo nuevo con número nuevo, valor nuevo de enum,
+//    campo eliminado con su número en `reserved`) se hacen DENTRO de cupo.v1.
+//  - Cambios incompatibles (reutilizar un número de campo, cambiar un tipo,
+//    renombrar o eliminar un RPC) exigen un paquete nuevo (cupo.v2) que
+//    convive con v1 hasta que todos los consumidores migren.
+// El nombre completo del servicio (/cupo.v1.Cupos/...) viaja en cada llamada,
+// por lo que un cliente v1 y un servidor v2 no se confunden entre sí.
+package cupo.v1;
 
 service Cupos {
 
@@ -14,7 +24,15 @@ service Cupos {
 
   rpc ocuparCupo(OcuparRequest) returns (OcuparResponse);
 
+  // Libera el cupo que ocupó EXACTAMENTE esa idempotency_key. Cupos es dueño del
+  // invariante de capacidad: una clave que nunca ocupó (o ya liberada con otra
+  // llamada) se rechaza con FAILED_PRECONDITION; no basta con que haya espacio.
   rpc liberarCupo(LiberarRequest) returns (LiberarResponse);
+
+  // Solo lectura. Dice qué pasó con una clave (ocupó / liberó / nada). Lo usa el
+  // conciliador de Matrículas para resolver un resultado incierto SIN modificar cupos.
+  // Agregado en v1 de forma compatible (RPC nuevo; los clientes anteriores lo ignoran).
+  rpc consultarOperacion(ConsultarOperacionRequest) returns (ConsultarOperacionResponse);
 }
 
 enum Estado {
@@ -63,3 +81,20 @@ message LiberarResponse {
   Estado estado = 1;
 }
 
+// Convención de errores de este contrato (ver D3): un resultado de NEGOCIO esperable viaja
+// en el enum `Estado` (SIN_CUPOS, CURSO_NO_ENCONTRADO); una operación que viola una
+// PRECONDICIÓN (liberar lo no ocupado) o un argumento inválido (clave vacía, clave usada
+// con otro curso) viaja como status gRPC (FAILED_PRECONDITION / INVALID_ARGUMENT).
+// obtenerCupo conserva NOT_FOUND por compatibilidad con v1; cupo.v2 lo unificará.
+
+message ConsultarOperacionRequest {
+  string idempotency_key = 1;
+}
+
+message ConsultarOperacionResponse {
+  // ESTADO_SIN_DEFINIR = la clave nunca ocupó nada (Cupos no retuvo ningún cupo).
+  Estado estado_ocupar = 1;
+  // ESTADO_SIN_DEFINIR = la clave no ha liberado (si estado_ocupar es CUPO_OCUPADO, el cupo sigue retenido).
+  Estado estado_liberar = 2;
+  int32 curso_id = 3;
+}
